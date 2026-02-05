@@ -117,7 +117,6 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
       print("\u{001B}[\(lines - 1)A", terminator: "")
       let picked = splitPrimarySecondary(options[index]).primary
       print("\(TUITheme.title("\(title):")) \(TUITheme.option(picked))")
-      print("")
       return index
     default:
       break

@@ -96,6 +96,9 @@ struct Capa: AsyncParsableCommand {
 
   mutating func run() async throws {
     print("capa (Native macOS Screen Capture)")
+    let isTTYOut = Terminal.isTTY(STDOUT_FILENO)
+    func sectionTitle(_ s: String) -> String { isTTYOut ? TUITheme.title(s) : s }
+    func muted(_ s: String) -> String { isTTYOut ? TUITheme.muted(s) : s }
 
     if listMicrophones {
       let audioDevices = AVCaptureDevice.DiscoverySession(
@@ -359,32 +362,30 @@ struct Capa: AsyncParsableCommand {
 
     let codecName = (codec == .hevc) ? "H.265/HEVC" : "H.264"
     if verbose {
-      print("Capture: \(Int(geometry.sourceRect.width))x\(Int(geometry.sourceRect.height)) pt @ \(scaleStr)x => \(geometry.pixelWidth)x\(geometry.pixelHeight) px")
-      print("Settings:")
-      print("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh")
+      print("")
+      print(sectionTitle("Settings:"))
+      print(muted("  Capture: \(Int(geometry.sourceRect.width))x\(Int(geometry.sourceRect.height)) pt @ \(scaleStr)x => \(geometry.pixelWidth)x\(geometry.pixelHeight) px"))
+      print(muted("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh"))
       if keepVFR {
-        print("  Screen timing: VFR")
+        print(muted("  Screen timing: VFR"))
       } else {
-        print("  Screen timing: CFR \(cfrFPS ?? 60) fps")
+        print(muted("  Screen timing: CFR \(cfrFPS ?? 60) fps"))
       }
       if includeCamera {
-        print("  Camera timing: native (no CFR)")
+        print(muted("  Camera timing: native (no CFR)"))
       }
       if includeMic, let audioDevice {
-        print("  Microphone: \(audioDevice.localizedName)")
+        print(muted("  Microphone: \(audioDevice.localizedName)"))
       } else {
-        print("  Microphone: none")
+        print(muted("  Microphone: none"))
       }
       if includeCamera, let cameraDevice {
-        print("  Camera: \(cameraDevice.localizedName)")
+        print(muted("  Camera: \(cameraDevice.localizedName)"))
       } else {
-        print("  Camera: none")
+        print(muted("  Camera: none"))
       }
-      print("  System audio: \(includeSystemAudio ? "on" : "off")")
-      print("Output (screen): \(outFile.path)")
-      if let cameraOutFile {
-        print("Output (camera): \(cameraOutFile.path)")
-      }
+      print(muted("  System audio: \(includeSystemAudio ? "on" : "off")"))
+      print("")
     }
     let canReadKeys = Terminal.isTTY(STDIN_FILENO)
     if canReadKeys {
@@ -487,17 +488,24 @@ struct Capa: AsyncParsableCommand {
       }
     }
 
+    print("")
+    print(sectionTitle("Outputs:"))
+    print("  Screen: \(outFile.path)")
+    if let cameraOutFile {
+      print("  Camera: \(cameraOutFile.path)")
+    }
+
     if verbose, includeSystemAudio || includeMic {
       let screenHasMaster = (includeSystemAudio || includeMic) && (includeCamera || (includeSystemAudio && includeMic))
       var parts: [String] = []
       if screenHasMaster { parts.append("qaa=Master (mixed)") }
       if includeMic { parts.append("qac=Mic") }
       if includeSystemAudio { parts.append("qab=System") }
-      print("Audio tracks (language tags): " + parts.joined(separator: ", "))
+      print(muted("  Audio tracks (language tags): " + parts.joined(separator: ", ")))
     }
     if verbose, includeCamera, cameraOutFile != nil {
-      print("Video files: screen=\(outFile.lastPathComponent), camera=\(cameraOutFile!.lastPathComponent)")
-      print("Camera file audio: a0=Mic (if enabled), a1=Master (mixed, for alignment)")
+      print(muted("  Video files: screen=\(outFile.lastPathComponent), camera=\(cameraOutFile!.lastPathComponent)"))
+      print(muted("  Camera file audio: a0=Mic (if enabled), a1=Master (mixed, for alignment)"))
     }
     print("")
     let shouldOpen: Bool
