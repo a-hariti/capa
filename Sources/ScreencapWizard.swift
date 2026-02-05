@@ -102,7 +102,12 @@ struct ScreencapWizard {
     if opts.nonInteractive {
       includeSystemAudio = opts.includeSystemAudio
     } else {
-      includeSystemAudio = promptYesNo("Capture system audio to a separate track?", defaultYes: false)
+      let idx = selectOption(
+        title: "Record System Audio?",
+        options: ["Yes", "No"],
+        defaultIndex: 0
+      )
+      includeSystemAudio = (idx == 0)
     }
 
     var audioDevice: AVCaptureDevice?
