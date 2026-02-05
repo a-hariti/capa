@@ -55,8 +55,11 @@ struct Capa: AsyncParsableCommand {
   @Option(name: .customLong("duration"), help: "Auto-stop after N seconds (non-interactive friendly)")
   var durationSeconds: Int?
 
-  @Option(name: [.customLong("out"), .customLong("output")], help: "Output file path (default: recs/screen-<ts>.mov)")
+  @Option(name: [.customLong("out"), .customLong("output")], help: "Output directory root (default: recs/<project>/screen.mov)")
   var outputPath: String?
+
+  @Option(name: .customLong("project-name"), help: "Project folder name (default: capa-<timestamp>)")
+  var projectName: String?
 
   @Flag(name: .customLong("open"), help: "Open file when done")
   var openFlag = false
@@ -92,6 +95,9 @@ struct Capa: AsyncParsableCommand {
     if let fps, fps < 1 {
       throw ValidationError("--fps must be >= 1")
     }
+    if let projectName, projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      throw ValidationError("--project-name must not be empty")
+    }
   }
 
   mutating func run() async throws {
@@ -104,6 +110,30 @@ struct Capa: AsyncParsableCommand {
     func sectionTitle(_ s: String) -> String { isTTYOut ? TUITheme.title(s) : s }
     func muted(_ s: String) -> String { isTTYOut ? TUITheme.muted(s) : s }
     func optionText(_ s: String) -> String { isTTYOut ? TUITheme.option(s) : s }
+    func sanitizeProjectName(_ s: String) -> String {
+      let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.isEmpty { return "capture" }
+      let forbidden = CharacterSet(charactersIn: "/:\\")
+      let mapped = trimmed.unicodeScalars.map { forbidden.contains($0) ? "-" : Character($0) }
+      return String(mapped)
+    }
+    func slugifyFilenameStem(_ s: String) -> String {
+      let lower = s.lowercased()
+      let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+      var out = ""
+      var prevDash = false
+      for sc in lower.unicodeScalars {
+        if allowed.contains(sc) {
+          out.unicodeScalars.append(sc)
+          prevDash = false
+        } else if !prevDash {
+          out.append("-")
+          prevDash = true
+        }
+      }
+      let trimmed = out.trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
+      return trimmed.isEmpty ? "camera" : trimmed
+    }
     func abbreviateHomePath(_ p: String) -> String {
       let home = NSHomeDirectory()
       if p == home { return "~" }
@@ -167,34 +197,6 @@ struct Capa: AsyncParsableCommand {
       return
     }
 
-    let autoSelectedSingleDisplay = (displayIndex == nil && content.displays.count == 1)
-    let display: SCDisplay
-    if let idx = displayIndex {
-      guard idx >= 0 && idx < content.displays.count else {
-        print("Error: --display-index out of range (0...\(content.displays.count - 1))")
-        return
-      }
-      display = content.displays[idx]
-    } else if content.displays.count == 1 {
-      display = content.displays[0]
-    } else if nonInteractive {
-      print("Error: missing display selection; use --display-index (or omit --non-interactive).")
-      return
-    } else {
-      let displayOptions = content.displays.map(displayLabel)
-      let displayIdx = selectOption(title: "Display", options: displayOptions, defaultIndex: 0)
-      display = content.displays[displayIdx]
-    }
-    let filter = SCContentFilter(display: display, excludingWindows: [])
-    let logicalWidth = Int(display.width)
-    let logicalHeight = Int(display.height)
-    let geometry = captureGeometry(filter: filter, fallbackLogicalSize: (logicalWidth, logicalHeight))
-
-    if autoSelectedSingleDisplay && !nonInteractive {
-      let displayLabel = isTTYOut ? TUITheme.primary("Display:") : "Display:"
-      print("\(displayLabel) \(optionText("\(geometry.pixelWidth)x\(geometry.pixelHeight)px"))")
-    }
-
     let audioDevices = AVCaptureDevice.DiscoverySession(
       deviceTypes: [.microphone, .external],
       mediaType: .audio,
@@ -207,24 +209,62 @@ struct Capa: AsyncParsableCommand {
       position: .unspecified
     ).devices
 
-    let includeSystemAudio: Bool
-    if systemAudioFlag {
-      includeSystemAudio = true
-    } else if nonInteractive {
-      includeSystemAudio = false
-    } else {
-      let idx = selectOption(
-        title: "Record System Audio?",
-        options: ["Yes", "No"],
-        defaultIndex: 0
-      )
-      includeSystemAudio = (idx == 0)
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyyMMdd-HHmmss"
+    let ts = formatter.string(from: Date())
+    let defaultProjectName = "capa-\(ts)"
+
+    let isSingleDisplay = (content.displays.count == 1)
+    enum WizardStep {
+      case projectName
+      case display
+      case systemAudio
+      case microphone
+      case camera
+      case codec
+    }
+    func clearPreviousAnswerLineIfTTY() {
+      guard isTTYOut else { return }
+      print("\u{001B}[1A\u{001B}[2K\r", terminator: "")
     }
 
+    var selectedDisplayIndex: Int?
+    var selectedProjectName = projectName?.trimmingCharacters(in: .whitespacesAndNewlines)
+    var includeSystemAudio: Bool?
     var audioDevice: AVCaptureDevice?
     var includeMic = false
+    var cameraDevice: AVCaptureDevice?
+    var includeCamera = false
+    var codec: AVVideoCodecType?
+
+    var displayDefaultIndex = 0
+    var systemAudioDefaultIndex = 0
+    var microphoneDefaultIndex = 0
+    var cameraDefaultIndex = 0
+    var codecDefaultIndex = 0
+
+    if let idx = displayIndex {
+      guard idx >= 0 && idx < content.displays.count else {
+        print("Error: --display-index out of range (0...\(content.displays.count - 1))")
+        return
+      }
+      selectedDisplayIndex = idx
+      displayDefaultIndex = idx
+    } else if content.displays.count == 1 {
+      selectedDisplayIndex = 0
+      displayDefaultIndex = 0
+    } else if nonInteractive {
+      print("Error: missing display selection; use --display-index (or omit --non-interactive).")
+      return
+    }
+
+    if systemAudioFlag || nonInteractive {
+      includeSystemAudio = systemAudioFlag
+    }
+
     if noMicrophone {
       includeMic = false
+      audioDevice = nil
     } else if let idx = microphoneIndex {
       guard idx >= 0 && idx < audioDevices.count else {
         print("Error: --mic-index out of range (0...\(max(0, audioDevices.count - 1)))")
@@ -239,33 +279,13 @@ struct Capa: AsyncParsableCommand {
       }
       audioDevice = d
       includeMic = true
-    } else if nonInteractive {
+    } else if nonInteractive || audioDevices.isEmpty {
       includeMic = false
-    } else if !audioDevices.isEmpty {
-      let audioOptions = ["No microphone"] + audioDevices.map(microphoneLabel)
-      let audioIdx = selectOption(title: "Microphone", options: audioOptions, defaultIndex: 0)
-      if audioIdx > 0 {
-        audioDevice = audioDevices[audioIdx - 1]
-        includeMic = true
-      }
+      audioDevice = nil
     }
 
-    if includeMic {
-      let micGranted = await requestMicrophoneAccess()
-      if !micGranted {
-        print("Microphone permission not granted. Continuing without microphone.")
-        print("System Settings -> Privacy & Security -> Microphone -> allow this binary.")
-        includeMic = false
-        audioDevice = nil
-      }
-    }
-
-    var cameraDevice: AVCaptureDevice?
-    var includeCamera = false
     if cameraFlag || cameraIndex != nil || cameraID != nil {
       includeCamera = true
-    }
-    if includeCamera {
       if let idx = cameraIndex {
         guard idx >= 0 && idx < videoDevices.count else {
           print("Error: --camera-index out of range (0...\(max(0, videoDevices.count - 1)))")
@@ -281,12 +301,258 @@ struct Capa: AsyncParsableCommand {
       } else {
         cameraDevice = videoDevices.first
       }
-    } else if !nonInteractive, !videoDevices.isEmpty {
-      let options = ["No camera"] + videoDevices.map(cameraLabel)
-      let idx = selectOption(title: "Camera", options: options, defaultIndex: 0)
-      if idx > 0 {
-        includeCamera = true
-        cameraDevice = videoDevices[idx - 1]
+    } else if nonInteractive || videoDevices.isEmpty {
+      includeCamera = false
+      cameraDevice = nil
+    }
+
+    if let c = codecString.flatMap(parseCodec) {
+      codec = c
+    } else if nonInteractive {
+      codec = .h264
+    }
+
+    var steps: [WizardStep] = []
+    if !nonInteractive && selectedProjectName == nil {
+      steps.append(.projectName)
+    }
+    if !nonInteractive { steps.append(.display) }
+    if includeSystemAudio == nil { steps.append(.systemAudio) }
+    if !noMicrophone && microphoneIndex == nil && microphoneID == nil && !nonInteractive && !audioDevices.isEmpty {
+      steps.append(.microphone)
+    }
+    if !cameraFlag && cameraIndex == nil && cameraID == nil && !nonInteractive && !videoDevices.isEmpty {
+      steps.append(.camera)
+    }
+    if codec == nil { steps.append(.codec) }
+
+    let firstRewindableStepIndex: Int = {
+      guard let first = steps.first else { return 0 }
+      return first == .display ? 1 : 0
+    }()
+    func previousRewindableStepIndex(from index: Int) -> Int? {
+      guard index > firstRewindableStepIndex else { return nil }
+      var i = index - 1
+      while i >= firstRewindableStepIndex {
+        if steps[i] != .display { return i }
+        i -= 1
+      }
+      return nil
+    }
+
+    var singleDisplayLinePrinted = false
+    var stepCursor = 0
+    while stepCursor < steps.count {
+      let allowBack = previousRewindableStepIndex(from: stepCursor) != nil
+      switch steps[stepCursor] {
+      case .projectName:
+        switch promptEditableDefault(title: "Project Name", defaultValue: defaultProjectName) {
+        case .submitted(let value):
+          selectedProjectName = sanitizeProjectName(value)
+          print("")
+          stepCursor += 1
+        case .cancel:
+          print("Canceled.")
+          return
+        }
+
+      case .display:
+        if isSingleDisplay {
+          selectedDisplayIndex = 0
+          if !singleDisplayLinePrinted {
+            let d = content.displays[0]
+            let filter = SCContentFilter(display: d, excludingWindows: [])
+            let geometry = captureGeometry(
+              filter: filter,
+              fallbackLogicalSize: (Int(d.width), Int(d.height))
+            )
+            let displayTitle = isTTYOut ? TUITheme.primary("Display:") : "Display:"
+            print("\(displayTitle) \(optionText("\(geometry.pixelWidth)x\(geometry.pixelHeight)px"))")
+            singleDisplayLinePrinted = true
+          }
+          stepCursor += 1
+        } else {
+          let displayOptions = content.displays.map(displayLabel)
+          let result = selectOptionWithBack(
+            title: "Display",
+            options: displayOptions,
+            defaultIndex: displayDefaultIndex,
+            allowBack: allowBack
+          )
+          switch result {
+          case .selected(let idx):
+            displayDefaultIndex = idx
+            selectedDisplayIndex = idx
+            stepCursor += 1
+          case .back:
+            if let backIdx = previousRewindableStepIndex(from: stepCursor) {
+              clearPreviousAnswerLineIfTTY()
+              if steps[backIdx] == .projectName {
+                clearPreviousAnswerLineIfTTY()
+                singleDisplayLinePrinted = false
+              }
+              stepCursor = backIdx
+            }
+          case .cancel:
+            print("Canceled.")
+            return
+          }
+        }
+
+      case .systemAudio:
+        let result = selectOptionWithBack(
+          title: "Record System Audio?",
+          options: ["Yes", "No"],
+          defaultIndex: systemAudioDefaultIndex,
+          allowBack: allowBack
+        )
+        switch result {
+        case .selected(let idx):
+          systemAudioDefaultIndex = idx
+          includeSystemAudio = (idx == 0)
+          stepCursor += 1
+        case .back:
+          if let backIdx = previousRewindableStepIndex(from: stepCursor) {
+            clearPreviousAnswerLineIfTTY()
+            if steps[backIdx] == .projectName {
+              clearPreviousAnswerLineIfTTY()
+              singleDisplayLinePrinted = false
+            }
+            stepCursor = backIdx
+          }
+        case .cancel:
+          print("Canceled.")
+          return
+        }
+
+      case .microphone:
+        let options = ["No microphone"] + audioDevices.map(microphoneLabel)
+        let result = selectOptionWithBack(
+          title: "Microphone",
+          options: options,
+          defaultIndex: microphoneDefaultIndex,
+          allowBack: allowBack
+        )
+        switch result {
+        case .selected(let idx):
+          microphoneDefaultIndex = idx
+          if idx > 0 {
+            includeMic = true
+            audioDevice = audioDevices[idx - 1]
+          } else {
+            includeMic = false
+            audioDevice = nil
+          }
+          stepCursor += 1
+        case .back:
+          if let backIdx = previousRewindableStepIndex(from: stepCursor) {
+            clearPreviousAnswerLineIfTTY()
+            if steps[backIdx] == .projectName {
+              clearPreviousAnswerLineIfTTY()
+              singleDisplayLinePrinted = false
+            }
+            stepCursor = backIdx
+          }
+        case .cancel:
+          print("Canceled.")
+          return
+        }
+
+      case .camera:
+        let options = ["No camera"] + videoDevices.map(cameraLabel)
+        let result = selectOptionWithBack(
+          title: "Camera",
+          options: options,
+          defaultIndex: cameraDefaultIndex,
+          allowBack: allowBack
+        )
+        switch result {
+        case .selected(let idx):
+          cameraDefaultIndex = idx
+          if idx > 0 {
+            includeCamera = true
+            cameraDevice = videoDevices[idx - 1]
+          } else {
+            includeCamera = false
+            cameraDevice = nil
+          }
+          stepCursor += 1
+        case .back:
+          if let backIdx = previousRewindableStepIndex(from: stepCursor) {
+            clearPreviousAnswerLineIfTTY()
+            if steps[backIdx] == .projectName {
+              clearPreviousAnswerLineIfTTY()
+              singleDisplayLinePrinted = false
+            }
+            stepCursor = backIdx
+          }
+        case .cancel:
+          print("Canceled.")
+          return
+        }
+
+      case .codec:
+        let codecOptions = ["H.264", "H.265/HEVC"]
+        let result = selectOptionWithBack(
+          title: "Video Codec",
+          options: codecOptions,
+          defaultIndex: codecDefaultIndex,
+          allowBack: allowBack
+        )
+        switch result {
+        case .selected(let idx):
+          codecDefaultIndex = idx
+          codec = (idx == 0) ? .h264 : .hevc
+          stepCursor += 1
+        case .back:
+          if let backIdx = previousRewindableStepIndex(from: stepCursor) {
+            clearPreviousAnswerLineIfTTY()
+            if steps[backIdx] == .projectName {
+              clearPreviousAnswerLineIfTTY()
+              singleDisplayLinePrinted = false
+            }
+            stepCursor = backIdx
+          }
+        case .cancel:
+          print("Canceled.")
+          return
+        }
+      }
+    }
+
+    guard let selectedDisplayIndex else {
+      print("Error: missing display selection.")
+      return
+    }
+    if selectedProjectName == nil {
+      selectedProjectName = defaultProjectName
+    }
+    guard let selectedProjectName else {
+      print("Error: missing project name.")
+      return
+    }
+    guard let includeSystemAudio else {
+      print("Error: missing system audio selection.")
+      return
+    }
+    guard let codec else {
+      print("Error: missing video codec selection.")
+      return
+    }
+
+    let display = content.displays[selectedDisplayIndex]
+    let filter = SCContentFilter(display: display, excludingWindows: [])
+    let logicalWidth = Int(display.width)
+    let logicalHeight = Int(display.height)
+    let geometry = captureGeometry(filter: filter, fallbackLogicalSize: (logicalWidth, logicalHeight))
+
+    if includeMic {
+      let micGranted = await requestMicrophoneAccess()
+      if !micGranted {
+        print("Microphone permission not granted. Continuing without microphone.")
+        print("System Settings -> Privacy & Security -> Microphone -> allow this binary.")
+        includeMic = false
+        audioDevice = nil
       }
     }
 
@@ -298,18 +564,6 @@ struct Capa: AsyncParsableCommand {
         includeCamera = false
         cameraDevice = nil
       }
-    }
-
-    let codec: AVVideoCodecType
-    if let c = codecString.flatMap(parseCodec) {
-      codec = c
-    } else if nonInteractive {
-      codec = .h264
-    } else {
-      let codecOptions = ["H.264", "H.265/HEVC"]
-      // QuickTime screen recordings default to H.264; keep that as our default as well.
-      let codecIdx = selectOption(title: "Video Codec", options: codecOptions, defaultIndex: 0)
-      codec = (codecIdx == 0) ? .h264 : .hevc
     }
 
     let cfrFPS: Int?
@@ -327,10 +581,6 @@ struct Capa: AsyncParsableCommand {
 
     let scaleStr = String(format: "%.2f", geometry.pointPixelScale)
 
-    let formatter = DateFormatter()
-    formatter.dateFormat = "yyyyMMdd-HHmmss"
-    let ts = formatter.string(from: Date())
-
     let recsDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("recs")
     try? FileManager.default.createDirectory(at: recsDir, withIntermediateDirectories: true)
 
@@ -339,9 +589,14 @@ struct Capa: AsyncParsableCommand {
     if let outputPath = outputPath {
       let u = URL(fileURLWithPath: outputPath)
       if u.pathExtension.isEmpty {
-        try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
-        outFile = u.appendingPathComponent("screen-\(ts).mov")
-        cameraOutFile = includeCamera ? u.appendingPathComponent("camera-\(ts).mov") : nil
+        let projectDir = u.appendingPathComponent(selectedProjectName, isDirectory: true)
+        try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        outFile = projectDir.appendingPathComponent("screen.mov")
+        if includeCamera, let cameraDevice {
+          cameraOutFile = projectDir.appendingPathComponent("\(slugifyFilenameStem(cameraDevice.localizedName)).mov")
+        } else {
+          cameraOutFile = includeCamera ? projectDir.appendingPathComponent("camera.mov") : nil
+        }
       } else {
         try? FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
         outFile = u
@@ -353,8 +608,14 @@ struct Capa: AsyncParsableCommand {
         }
       }
     } else {
-      outFile = recsDir.appendingPathComponent("screen-\(ts).mov")
-      cameraOutFile = includeCamera ? recsDir.appendingPathComponent("camera-\(ts).mov") : nil
+      let projectDir = recsDir.appendingPathComponent(selectedProjectName, isDirectory: true)
+      try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+      outFile = projectDir.appendingPathComponent("screen.mov")
+      if includeCamera, let cameraDevice {
+        cameraOutFile = projectDir.appendingPathComponent("\(slugifyFilenameStem(cameraDevice.localizedName)).mov")
+      } else {
+        cameraOutFile = includeCamera ? projectDir.appendingPathComponent("camera.mov") : nil
+      }
     }
 
     let hasMic = includeMic
@@ -514,10 +775,13 @@ struct Capa: AsyncParsableCommand {
     }
 
     print("")
-    print(sectionTitle("Files:"))
-    print("\(isTTYOut ? TUITheme.label("  Screen:") : "  Screen:") \(abbreviateHomePath(outFile.path))")
     if let cameraOutFile {
+      print(sectionTitle("Files:"))
+      print("\(isTTYOut ? TUITheme.label("  Screen:") : "  Screen:") \(abbreviateHomePath(outFile.path))")
       print("\(isTTYOut ? TUITheme.label("  Camera:") : "  Camera:") \(abbreviateHomePath(cameraOutFile.path))")
+    } else {
+      let savedLabel = isTTYOut ? TUITheme.label("Saved to:") : "Saved to:"
+      print("\(savedLabel) \(abbreviateHomePath(outFile.path))")
     }
 
     if verbose, includeSystemAudio || includeMic {
@@ -533,19 +797,8 @@ struct Capa: AsyncParsableCommand {
       print(muted("  Camera file audio: a0=Mic (if enabled), a1=Master (mixed, for alignment)"))
     }
     print("")
-    let shouldOpen: Bool
-    if openFlag {
-      shouldOpen = true
-    } else if noOpenFlag {
-      shouldOpen = false
-    } else if nonInteractive {
-      shouldOpen = false
-    } else if Terminal.isTTY(STDIN_FILENO) {
-      let prompt = includeCamera ? "Open screen capture?" : "Open file now?"
-      shouldOpen = (selectOption(title: prompt, options: ["Yes", "No"], defaultIndex: 0) == 0)
-    } else {
-      shouldOpen = promptYesNo("Open file now?", defaultYes: true)
-    }
+    // CLI-driven default: open unless explicitly disabled.
+    let shouldOpen = !noOpenFlag
 
     if shouldOpen {
       let p = Process()

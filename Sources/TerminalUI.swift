@@ -5,6 +5,10 @@ enum Key {
   case up
   case down
   case enter
+  case escape
+  case backspace
+  case ctrlC
+  case ctrlD
   case char(Character)
   case unknown
 }
@@ -17,12 +21,15 @@ final class Terminal {
     isatty(fd) != 0
   }
 
-  static func enableRawMode() {
+  static func enableRawMode(disableSignals: Bool = false) {
     guard !rawEnabled else { return }
     var raw = termios()
     tcgetattr(STDIN_FILENO, &original)
     raw = original
     raw.c_lflag &= ~(UInt(ECHO | ICANON))
+    if disableSignals {
+      raw.c_lflag &= ~UInt(ISIG)
+    }
     withUnsafeMutablePointer(to: &raw.c_cc) { ccPtr in
       ccPtr.withMemoryRebound(to: cc_t.self, capacity: Int(NCCS)) { cc in
         cc[Int(VMIN)] = 1
@@ -46,25 +53,63 @@ final class Terminal {
     if n <= 0 { return .unknown }
 
     if buffer[0] == 0x1b {
-      let n2 = read(STDIN_FILENO, &buffer, 2)
-      if n2 == 2 && buffer[0] == 0x5b {
-        if buffer[1] == 0x41 { return .up }
-        if buffer[1] == 0x42 { return .down }
+      guard let b1 = readByte(timeoutMs: 20) else {
+        return .escape
+      }
+      if b1 == 0x5b, let b2 = readByte(timeoutMs: 20) {
+        if b2 == 0x41 { return .up }
+        if b2 == 0x42 { return .down }
       }
       return .unknown
     }
 
     if buffer[0] == 0x0a || buffer[0] == 0x0d { return .enter }
+    if buffer[0] == 0x08 || buffer[0] == 0x7f { return .backspace }
+    if buffer[0] == 0x03 { return .ctrlC }
+    if buffer[0] == 0x04 { return .ctrlD }
     if let scalar = UnicodeScalar(UInt32(buffer[0])) {
       return .char(Character(scalar))
     }
     return .unknown
   }
+
+  private static func readByte(timeoutMs: Int32) -> UInt8? {
+    var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+    let ready = poll(&fds, 1, timeoutMs)
+    guard ready > 0, (fds.revents & Int16(POLLIN)) != 0 else {
+      return nil
+    }
+    var b: UInt8 = 0
+    let n = read(STDIN_FILENO, &b, 1)
+    return n == 1 ? b : nil
+  }
+}
+
+enum SelectionResult {
+  case selected(Int)
+  case back
+  case cancel
+}
+
+enum TextInputResult {
+  case submitted(String)
+  case cancel
 }
 
 func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
-  guard Terminal.isTTY(STDIN_FILENO) else {
+  switch selectOptionWithBack(title: title, options: options, defaultIndex: defaultIndex, allowBack: false) {
+  case .selected(let idx):
+    return idx
+  case .back:
     return min(max(defaultIndex, 0), options.count - 1)
+  case .cancel:
+    return min(max(defaultIndex, 0), options.count - 1)
+  }
+}
+
+func selectOptionWithBack(title: String, options: [String], defaultIndex: Int, allowBack: Bool) -> SelectionResult {
+  guard Terminal.isTTY(STDIN_FILENO) else {
+    return .selected(min(max(defaultIndex, 0), options.count - 1))
   }
   var index = min(max(defaultIndex, 0), options.count - 1)
   let lines = options.count + 2
@@ -91,11 +136,13 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
         print("    \(TUITheme.option(parts.primary))\(secondary)")
       }
     }
-    let hint = "↑/↓ move\(TUITheme.Glyph.pickerHintSep)Enter select"
+    let hint = allowBack
+      ? "↑/↓ move\(TUITheme.Glyph.pickerHintSep)Enter select\(TUITheme.Glyph.pickerHintSep)Esc back"
+      : "↑/↓ move\(TUITheme.Glyph.pickerHintSep)Enter select"
     print(TUITheme.muted(hint))
   }
 
-  Terminal.enableRawMode()
+  Terminal.enableRawMode(disableSignals: true)
   defer { Terminal.disableRawMode() }
 
   render()
@@ -117,7 +164,30 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
       print("\u{001B}[\(lines - 1)A", terminator: "")
       let picked = splitPrimarySecondary(options[index]).primary
       print("\(TUITheme.primary("\(title):")) \(TUITheme.option(picked))")
-      return index
+      return .selected(index)
+    case .escape:
+      guard allowBack else { break }
+      // Remove current prompt block completely before navigating back.
+      print("\u{001B}[\(lines)A", terminator: "")
+      for n in 0..<lines {
+        print("\u{001B}[2K\r", terminator: "")
+        if n < lines - 1 {
+          print("\u{001B}[1B", terminator: "")
+        }
+      }
+      print("\u{001B}[\(lines - 1)A", terminator: "")
+      return .back
+    case .ctrlC, .ctrlD:
+      // Remove prompt block and cancel the whole interaction gracefully.
+      print("\u{001B}[\(lines)A", terminator: "")
+      for n in 0..<lines {
+        print("\u{001B}[2K\r", terminator: "")
+        if n < lines - 1 {
+          print("\u{001B}[1B", terminator: "")
+        }
+      }
+      print("\u{001B}[\(lines - 1)A", terminator: "")
+      return .cancel
     default:
       break
     }
@@ -125,6 +195,56 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
     // Move cursor up to redraw.
     print("\u{001B}[\(lines)A", terminator: "")
     render()
+  }
+}
+
+func promptEditableDefault(title: String, defaultValue: String) -> TextInputResult {
+  guard Terminal.isTTY(STDIN_FILENO) else {
+    return .submitted(defaultValue)
+  }
+
+  var value = defaultValue
+  var untouched = true
+
+  func render() {
+    let line = "\(TUITheme.primary("\(title):")) \(TUITheme.label(value))"
+    print("\r\u{001B}[2K\(line)", terminator: "")
+    fflush(stdout)
+  }
+
+  Terminal.enableRawMode(disableSignals: true)
+  defer { Terminal.disableRawMode() }
+
+  render()
+  while true {
+    switch Terminal.readKey() {
+    case .enter:
+      print("")
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return .submitted(trimmed.isEmpty ? defaultValue : trimmed)
+    case .ctrlC, .ctrlD:
+      print("\r\u{001B}[2K", terminator: "")
+      print("")
+      return .cancel
+    case .backspace:
+      if untouched {
+        untouched = false
+      }
+      if !value.isEmpty {
+        value.removeLast()
+      }
+      render()
+    case .char(let c):
+      if c.isNewline { continue }
+      if untouched {
+        value = ""
+        untouched = false
+      }
+      value.append(c)
+      render()
+    default:
+      continue
+    }
   }
 }
 
