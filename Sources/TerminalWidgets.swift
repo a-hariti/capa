@@ -7,6 +7,7 @@ enum Ansi {
   static let showCursor = "\u{001B}[?25h"
 
   static func fg256(_ n: Int) -> String { "\u{001B}[38;5;\(n)m" }
+  static func bg256(_ n: Int) -> String { "\u{001B}[48;5;\(n)m" }
 
   static func visibleWidth(_ s: String) -> Int {
     // Best-effort terminal "cell" width, ignoring ANSI escape sequences and common zero-width scalars.
@@ -47,16 +48,18 @@ struct Bar {
     let t = max(0.0, min(1.0, fraction))
     switch style {
     case .smooth:
-      // Render in 1/8th-cell units for a smoother bar.
+      // Render in 1/8th-cell units.
       let partial = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
       let units = Int((Double(w) * 8.0 * t).rounded(.toNearestOrAwayFromZero))
       let full = min(w, units / 8)
       let rem = units % 8
       let hasPartial = rem > 0 && full < w
       let rest = w - full - (hasPartial ? 1 : 0)
+
+      // Use full blocks for both filled and unfilled; color determines meaning.
       return String(repeating: "█", count: full)
         + (hasPartial ? partial[rem] : "")
-        + String(repeating: "░", count: max(0, rest))
+        + String(repeating: "█", count: max(0, rest))
 
     case .steps:
       let chars = Array("▁▂▃▄▅▆▇█")
@@ -70,7 +73,7 @@ final class ProgressBar: @unchecked Sendable {
   private let fd: UnsafeMutablePointer<FILE> = stderr
   private let prefix: String
   private let total: Int64
-  private var lastLen = 0
+  private var lastVisibleLen = 0
   private var lastUnits: Int = -1
   private var active = false
 
@@ -89,19 +92,24 @@ final class ProgressBar: @unchecked Sendable {
     guard active else { return }
     let clamped = max(0, min(total, completed))
 
-    // Smoothly track bar fill, not just integer percent.
     let width = 24
     let units = Int((Double(clamped) / Double(total)) * Double(width * 8))
     if units == lastUnits { return }
     lastUnits = units
 
     let pct = Int((Double(clamped) / Double(total)) * 100.0)
-    let bar = Bar.render(fraction: Double(clamped) / Double(total), width: width, style: .smooth)
-    let lead = prefix.isEmpty ? "" : "\(prefix) "
-    let s = "\(lead)[\(bar)] \(pct)%"
+    let frac = Double(clamped) / Double(total)
 
-    let pad = max(0, lastLen - s.utf8.count)
-    lastLen = s.utf8.count
+    // Track + fill colors. Use background on the partial cell to avoid "gaps" showing terminal background.
+    let track = 236
+    let fill = 255
+    let bar = Bar.renderColoredSmooth(fraction: frac, width: width, fillFG: fill, trackFG: track, trackBG: track)
+    let lead = prefix.isEmpty ? "" : "\(prefix) "
+    let s = "\(lead)\(bar)\(Ansi.reset) \(pct)%"
+
+    let visibleLen = Ansi.visibleWidth(s)
+    let pad = max(0, lastVisibleLen - visibleLen)
+    lastVisibleLen = visibleLen
     write("\r" + s + String(repeating: " ", count: pad))
   }
 
@@ -141,14 +149,57 @@ struct LoudnessMeter {
     let reset = Ansi.reset
     guard let db else {
       let c = Ansi.fg256(245)
-      let bar = Bar.render(fraction: 0, width: width, style: style)
-      return "\(label) \(c)--dB \(c)[\(bar)]\(reset)"
+      let bar: String
+      switch style {
+      case .smooth:
+        bar = Bar.renderColoredSmooth(fraction: 0, width: width, fillFG: 245, trackFG: 236, trackBG: 236)
+      case .steps:
+        bar = c + Bar.render(fraction: 0, width: width, style: .steps)
+      }
+      return "\(label) \(c)--dB \(bar)\(reset)"
     }
 
     let c = color(db: db)
     let frac = fraction(db: db)
-    let bar = Bar.render(fraction: frac, width: width, style: style)
     let dbStr = String(format: "%@%3.0fdB%@", c, db, reset)
-    return "\(label) \(dbStr) \(c)[\(bar)]\(reset)"
+    let bar: String
+    switch style {
+    case .smooth:
+      // For meters, use the db-driven color as the fill, and a fixed dark track.
+      // The color escape in `c` is a foreground; extract the 256 code where possible is not worth it.
+      // Just use green/yellow/red as 46/226/196.
+      let fillFG: Int = (db >= -12) ? 196 : (db >= -24) ? 226 : 46
+      bar = Bar.renderColoredSmooth(fraction: frac, width: width, fillFG: fillFG, trackFG: 236, trackBG: 236)
+    case .steps:
+      bar = c + Bar.render(fraction: frac, width: width, style: .steps)
+    }
+
+    return "\(label) \(dbStr) \(bar)\(reset)"
+  }
+}
+
+extension Bar {
+  static func renderColoredSmooth(fraction: Double, width: Int, fillFG: Int, trackFG: Int, trackBG: Int) -> String {
+    let w = max(1, width)
+    let t = max(0.0, min(1.0, fraction))
+    let units = Int((Double(w) * 8.0 * t).rounded(.toNearestOrAwayFromZero))
+    let full = min(w, units / 8)
+    let rem = units % 8
+    let hasPartial = rem > 0 && full < w
+    let rest = w - full - (hasPartial ? 1 : 0)
+
+    let partial = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+
+    var s = Ansi.bg256(trackBG)
+    if full > 0 {
+      s += Ansi.fg256(fillFG) + String(repeating: "█", count: full)
+    }
+    if hasPartial {
+      s += Ansi.fg256(fillFG) + partial[rem]
+    }
+    if rest > 0 {
+      s += Ansi.fg256(trackFG) + String(repeating: "█", count: rest)
+    }
+    return s
   }
 }

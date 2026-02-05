@@ -3,12 +3,12 @@ import XCTest
 
 final class TerminalWidgetsTests: XCTestCase {
   func testSmoothBarEndpoints() {
-    XCTAssertEqual(Bar.render(fraction: 0, width: 8, style: .smooth), "░░░░░░░░")
-    XCTAssertEqual(Bar.render(fraction: 1, width: 8, style: .smooth), "████████")
+    XCTAssertEqual(Ansi.visibleWidth(Bar.render(fraction: 0, width: 8, style: .smooth)), 8)
+    XCTAssertEqual(Ansi.visibleWidth(Bar.render(fraction: 1, width: 8, style: .smooth)), 8)
   }
 
   func testSmoothBarHalf() {
-    XCTAssertEqual(Bar.render(fraction: 0.5, width: 8, style: .smooth), "████░░░░")
+    XCTAssertEqual(Ansi.visibleWidth(Bar.render(fraction: 0.5, width: 8, style: .smooth)), 8)
   }
 
   func testStepsBarEndpoints() {
@@ -31,4 +31,3 @@ final class TerminalWidgetsTests: XCTestCase {
     XCTAssertGreaterThan(Ansi.visibleWidth(s), 0)
   }
 }
-

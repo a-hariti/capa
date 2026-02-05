@@ -51,8 +51,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
   private var stream: SCStream?
 
   private var cameraSession: AVCaptureSession?
+  // Hints are useful for picking encoder settings, but the true dimensions/pixel format are taken from
+  // the first delivered camera sample.
   private var cameraFormatHint: CMFormatDescription?
-  private var cameraDims: (w: Int, h: Int)?
 
   private var writer: AVAssetWriter?
   private var videoIn: AVAssetWriterInput?
@@ -74,6 +75,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
   private var preStartCamera: [CMSampleBuffer] = []
   private var firstScreenSample: CMSampleBuffer?
   private var firstCameraSample: CMSampleBuffer?
+  private var cameraPTSOffset: CMTime = .zero
 
   private var isStopping = false
   private var lastPTS: CMTime = .zero
@@ -189,7 +191,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     self.firstScreenSample = nil
     self.firstCameraSample = nil
     self.cameraFormatHint = nil
-    self.cameraDims = nil
+    self.cameraPTSOffset = .zero
     self.failure = nil
     self.isStopping = false
     self.lastPTS = .zero
@@ -279,7 +281,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     guard CMSampleBufferDataIsReady(sample) else { return }
     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
 
-    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+    let pts = CMSampleBufferGetPresentationTimeStamp(sample) + cameraPTSOffset
 
     do {
       if sessionStartPTS == nil {
@@ -295,9 +297,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
       guard writer.status == .writing else { return }
       guard cameraVideoIn.isReadyForMoreMediaData else { return }
 
-      if !cameraAdaptor.append(pixelBuffer, withPresentationTime: pts) {
-        throw writer.error ?? NSError(domain: "ScreenRecorder", code: 12, userInfo: [NSLocalizedDescriptionKey: "Camera video append failed (status: \(writer.status))"])
-      }
+	      if !cameraAdaptor.append(pixelBuffer, withPresentationTime: pts) {
+	        throw writer.error ?? NSError(domain: "ScreenRecorder", code: 12, userInfo: [NSLocalizedDescriptionKey: "Camera video append failed (status: \(writer.status))"])
+	      }
 
       lastPTS = max(lastPTS, pts)
     } catch {
@@ -334,15 +336,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
       throw NSError(domain: "ScreenRecorder", code: 80, userInfo: [NSLocalizedDescriptionKey: "Camera enabled but no camera device found"])
     }
 
-    let fd = device.activeFormat.formatDescription
-    let dims = CMVideoFormatDescriptionGetDimensions(fd)
-    if dims.width > 0 && dims.height > 0 {
-      cameraFormatHint = fd
-      cameraDims = (w: Int(dims.width), h: Int(dims.height))
-    } else {
-      cameraFormatHint = fd
-      cameraDims = nil
-    }
+    cameraFormatHint = device.activeFormat.formatDescription
 
     let input = try AVCaptureDeviceInput(device: device)
     guard session.canAddInput(input) else {
@@ -379,16 +373,15 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     guard sessionStartPTS == nil else { return }
     guard writer == nil else { return } // writer/session start happen together
     guard let firstScreenSample else { return }
-    let startPTS: CMTime = {
-      let s = CMSampleBufferGetPresentationTimeStamp(firstScreenSample)
-      if let c = firstCameraSample {
-        let cp = CMSampleBufferGetPresentationTimeStamp(c)
-        return min(s, cp)
-      }
-      return s
-    }()
+    if options.includeCamera && firstCameraSample == nil { return }
+    // Screen recording is the master timeline for the file.
+    let startPTS = CMSampleBufferGetPresentationTimeStamp(firstScreenSample)
+    if let firstCameraSample {
+      let camPTS = CMSampleBufferGetPresentationTimeStamp(firstCameraSample)
+      cameraPTSOffset = startPTS - camPTS
+    }
 
-    try startWriterLocked(startPTS: startPTS, firstScreenSample: firstScreenSample)
+    try startWriterLocked(startPTS: startPTS, firstScreenSample: firstScreenSample, firstCameraSample: firstCameraSample)
     flushPreStartVideoLockedIfNeeded()
   }
 
@@ -398,10 +391,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     guard let writer, writer.status == .writing else { return }
     guard let sessionStartPTS else { return }
 
-    func drain(queue: inout [CMSampleBuffer], input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor) {
+    func drain(queue: inout [CMSampleBuffer], input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor, adjustPTS: (CMTime) -> CMTime) {
       while !queue.isEmpty && input.isReadyForMoreMediaData {
         let s = queue.removeFirst()
-        let pts = CMSampleBufferGetPresentationTimeStamp(s)
+        let pts = adjustPTS(CMSampleBufferGetPresentationTimeStamp(s))
         if pts < sessionStartPTS { continue }
         guard let pb = CMSampleBufferGetImageBuffer(s) else { continue }
         if !adaptor.append(pb, withPresentationTime: pts) {
@@ -413,10 +406,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     }
 
     if let videoIn, let videoAdaptor, !preStartScreen.isEmpty {
-      drain(queue: &preStartScreen, input: videoIn, adaptor: videoAdaptor)
+      drain(queue: &preStartScreen, input: videoIn, adaptor: videoAdaptor, adjustPTS: { $0 })
     }
     if let cameraVideoIn, let cameraAdaptor, !preStartCamera.isEmpty {
-      drain(queue: &preStartCamera, input: cameraVideoIn, adaptor: cameraAdaptor)
+      drain(queue: &preStartCamera, input: cameraVideoIn, adaptor: cameraAdaptor, adjustPTS: { $0 + cameraPTSOffset })
     }
   }
 
@@ -490,7 +483,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     }
   }
 
-  private func startWriterLocked(startPTS: CMTime, firstScreenSample: CMSampleBuffer) throws {
+  private func startWriterLocked(startPTS: CMTime, firstScreenSample: CMSampleBuffer, firstCameraSample: CMSampleBuffer?) throws {
     precondition(!Thread.isMainThread)
     guard let fmt = CMSampleBufferGetFormatDescription(firstScreenSample) else {
       throw NSError(domain: "ScreenRecorder", code: 30, userInfo: [NSLocalizedDescriptionKey: "Missing format description"])
@@ -558,22 +551,21 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     var cameraVideoIn: AVAssetWriterInput?
     var cameraAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     if options.includeCamera {
-      guard let cameraFormatHint else {
-        throw NSError(domain: "ScreenRecorder", code: 35, userInfo: [NSLocalizedDescriptionKey: "Camera enabled but missing format hint"])
+      guard
+        let firstCameraSample,
+        let cameraFmt = CMSampleBufferGetFormatDescription(firstCameraSample),
+        let cameraPB = CMSampleBufferGetImageBuffer(firstCameraSample)
+      else {
+        throw NSError(domain: "ScreenRecorder", code: 35, userInfo: [NSLocalizedDescriptionKey: "Camera enabled but missing first camera sample"])
       }
-      let (camW, camH): (Int, Int) = {
-        if let cameraDims { return (cameraDims.w, cameraDims.h) }
-        let d = CMVideoFormatDescriptionGetDimensions(cameraFormatHint)
-        return (Int(d.width), Int(d.height))
-      }()
-      guard camW > 0 && camH > 0 else {
-        throw NSError(domain: "ScreenRecorder", code: 36, userInfo: [NSLocalizedDescriptionKey: "Camera enabled but unknown dimensions"])
-      }
+
+      let camW = CVPixelBufferGetWidth(cameraPB)
+      let camH = CVPixelBufferGetHeight(cameraPB)
 
       guard let assistant2 = AVOutputSettingsAssistant(preset: preset) else {
         throw NSError(domain: "ScreenRecorder", code: 37, userInfo: [NSLocalizedDescriptionKey: "AVOutputSettingsAssistant unavailable for camera preset \(preset)"])
       }
-      assistant2.sourceVideoFormat = cameraFormatHint
+      assistant2.sourceVideoFormat = cameraFmt
       guard var camSettings = assistant2.videoSettings else {
         throw NSError(domain: "ScreenRecorder", code: 38, userInfo: [NSLocalizedDescriptionKey: "Missing camera video settings"])
       }
@@ -594,7 +586,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
         camSettings[AVVideoCompressionPropertiesKey] = compression
       }
 
-      let camIn = AVAssetWriterInput(mediaType: .video, outputSettings: camSettings, sourceFormatHint: cameraFormatHint)
+      let camIn = AVAssetWriterInput(mediaType: .video, outputSettings: camSettings, sourceFormatHint: cameraFmt)
       camIn.expectsMediaDataInRealTime = true
       guard writer.canAdd(camIn) else {
         throw NSError(domain: "ScreenRecorder", code: 39, userInfo: [NSLocalizedDescriptionKey: "Cannot add camera video input"])
@@ -602,7 +594,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
       writer.add(camIn)
 
       let camAdaptorAttrs: [String: Any] = [
-        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+        kCVPixelBufferPixelFormatTypeKey as String: Int(CVPixelBufferGetPixelFormatType(cameraPB)),
         kCVPixelBufferWidthKey as String: camW,
         kCVPixelBufferHeightKey as String: camH,
         kCVPixelBufferIOSurfacePropertiesKey as String: [:],
