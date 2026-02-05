@@ -41,6 +41,7 @@ enum TUITheme {
   enum Color {
     static let title = 255
     static let label = 252
+    static let option = 250
     static let muted = 244
     static let accent = 39
     static let progressFill = 255
@@ -62,6 +63,10 @@ enum TUITheme {
 
   static func label(_ s: String) -> String {
     "\(Ansi.fg256(Color.label))\(s)\(Ansi.reset)"
+  }
+
+  static func option(_ s: String) -> String {
+    "\(Ansi.fg256(Color.option))\(s)\(Ansi.reset)"
   }
 
   static func muted(_ s: String) -> String {

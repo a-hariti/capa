@@ -75,7 +75,7 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
       if i == index {
         print("  \(TUITheme.accent(TUITheme.Glyph.pickerCaret, bold: true)) \(Ansi.bold)\(TUITheme.accent(options[i], bold: true))\(Ansi.reset)")
       } else {
-        print("    \(TUITheme.muted(options[i]))")
+        print("    \(TUITheme.option(options[i]))")
       }
     }
     let hint = "↑/↓ move\(TUITheme.Glyph.pickerHintSep)Enter select"
