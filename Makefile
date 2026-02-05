@@ -1,7 +1,7 @@
 BIN := capa
 SPM := swift
 
-.PHONY: build install run clean
+.PHONY: build install run test clean
 
 build:
 	$(SPM) build -c release --disable-sandbox
@@ -14,6 +14,9 @@ install: build
 # Pass args via: make run ARGS="--non-interactive --duration 5"
 run: install
 	./$(BIN) $(ARGS)
+
+test:
+	$(SPM) test
 
 clean:
 	rm -f ./$(BIN)
