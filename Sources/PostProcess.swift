@@ -58,8 +58,7 @@ enum PostProcess {
 
     // Atomic-ish replace on same volume.
     let fm = FileManager.default
-    _ = try? fm.removeItem(at: url)
-    try fm.moveItem(at: tmpURL, to: url)
+    _ = try? fm.replaceItemAt(url, withItemAt: tmpURL, backupItemName: nil, options: .usingNewMetadataOnly)
   }
 
   // MARK: - Implementation
