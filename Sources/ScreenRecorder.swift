@@ -20,9 +20,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     var width: Int
     var height: Int
-
-    /// `0` means native refresh (minimumFrameInterval = .zero).
-    var fps: Int = 60
   }
 
   private struct UnsafeSample: @unchecked Sendable {
@@ -125,12 +122,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     cfg.preservesAspectRatio = true
     cfg.queueDepth = 6
 
-    if options.fps <= 0 {
-      // Per Apple headers: kCMTimeZero => capture at native refresh.
-      cfg.minimumFrameInterval = .zero
-    } else {
-      cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(max(1, min(240, options.fps))))
-    }
+    // Capture at native refresh. We post-process to CFR 60 fps by default in the CLI.
+    cfg.minimumFrameInterval = .zero
 
     cfg.captureDynamicRange = .SDR
 
@@ -327,9 +320,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
       compression[kVTCompressionPropertyKey_RealTime as String] = true
       compression[kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String] = false
 
-      let fps = (options.fps <= 0) ? 60 : max(1, min(240, options.fps))
-      compression[AVVideoExpectedSourceFrameRateKey] = fps
-      compression[AVVideoMaxKeyFrameIntervalKey] = fps * 2
+      // Keep editing-friendly GOPs without hard-coding a capture framerate.
+      compression[AVVideoMaxKeyFrameIntervalDurationKey] = 2.0
       compression[AVVideoAllowFrameReorderingKey] = false
 
       // Avoid artificially restricting quality. Let the encoder allocate bits as needed.

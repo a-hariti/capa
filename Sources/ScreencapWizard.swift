@@ -76,14 +76,8 @@ struct ScreencapWizard {
         return
       }
       display = content.displays[idx]
-    } else if let id = opts.displayID {
-      guard let d = content.displays.first(where: { $0.displayID == id }) else {
-        print("Error: no display with id \(id)")
-        return
-      }
-      display = d
     } else if opts.nonInteractive {
-      print("Error: missing display selection; use --display-index or --display-id (or omit --non-interactive).")
+      print("Error: missing display selection; use --display-index (or omit --non-interactive).")
       return
     } else {
       let displayOptions = content.displays.map(displayLabel)
@@ -204,18 +198,13 @@ struct ScreencapWizard {
       microphoneDeviceID: includeMic ? audioDevice?.uniqueID : nil,
       includeSystemAudio: includeSystemAudio,
       width: geometry.pixelWidth,
-      height: geometry.pixelHeight,
-      fps: opts.fps
+      height: geometry.pixelHeight
     )
     let recorder = ScreenRecorder(filter: filter, options: recorderOptions)
 
     let codecName = (codec == .hevc) ? "H.265/HEVC" : "H.264"
     print("Settings:")
-    if opts.fps == 0 {
-      print("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh")
-    } else {
-      print("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ \(opts.fps) fps")
-    }
+    print("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh")
     if opts.keepVFR {
       print("  Timing: VFR")
     } else {
@@ -311,7 +300,6 @@ struct ScreencapWizard {
       }
     }
 
-    print("Saved.")
     if includeSystemAudio || includeMic {
       var parts: [String] = []
       parts.append("qaa=Master (mixed)")

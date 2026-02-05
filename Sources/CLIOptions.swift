@@ -9,7 +9,6 @@ struct CLIOptions: Sendable {
   var listMicrophones = false
 
   var displayIndex: Int?
-  var displayID: UInt32?
 
   var noMicrophone = false
   var microphoneIndex: Int?
@@ -24,8 +23,6 @@ struct CLIOptions: Sendable {
   var keepVFR = false
 
   var codec: AVVideoCodecType?
-  /// `0` means "native refresh rate" (passes `kCMTimeZero` to ScreenCaptureKit).
-  var fps: Int = 60
   var durationSeconds: Int?
 
   var outputPath: String?
@@ -48,13 +45,6 @@ struct CLIOptions: Sendable {
 
       func parseInt(_ s: String, _ flag: String) throws -> Int {
         guard let v = Int(s) else {
-          throw NSError(domain: "CLI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid \(flag): \(s)"])
-        }
-        return v
-      }
-
-      func parseUInt32(_ s: String, _ flag: String) throws -> UInt32 {
-        guard let v = UInt32(s) else {
           throw NSError(domain: "CLI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid \(flag): \(s)"])
         }
         return v
@@ -93,19 +83,6 @@ struct CLIOptions: Sendable {
       if a.hasPrefix("--display-index=") {
         let v = String(a.split(separator: "=", maxSplits: 1)[1])
         out.displayIndex = try parseInt(v, "--display-index")
-        i += 1
-        continue
-      }
-
-      if a == "--display-id" {
-        let v = try parseUInt32(try takeValue(argv, &i), a)
-        out.displayID = v
-        i += 1
-        continue
-      }
-      if a.hasPrefix("--display-id=") {
-        let v = String(a.split(separator: "=", maxSplits: 1)[1])
-        out.displayID = try parseUInt32(v, "--display-id")
         i += 1
         continue
       }
@@ -184,19 +161,6 @@ struct CLIOptions: Sendable {
         continue
       }
 
-      if a == "--fps" {
-        let v = try parseInt(try takeValue(argv, &i), a)
-        out.fps = max(0, min(240, v))
-        i += 1
-        continue
-      }
-      if a.hasPrefix("--fps=") {
-        let v = try parseInt(String(a.split(separator: "=", maxSplits: 1)[1]), "--fps")
-        out.fps = max(0, min(240, v))
-        i += 1
-        continue
-      }
-
       if a == "--duration" {
         let v = try parseInt(try takeValue(argv, &i), a)
         out.durationSeconds = max(1, v)
@@ -258,7 +222,6 @@ struct CLIOptions: Sendable {
       --list-displays                 List available displays and exit
       --list-mics                     List available microphones and exit
       --display-index N               Select display by index (from --list-displays)
-      --display-id ID                 Select display by CGDirectDisplayID
       --no-mic                        Disable microphone
       --mic-index N                   Select microphone by index (from --list-mics)
       --mic-id ID                     Select microphone by AVCaptureDevice.uniqueID
@@ -266,7 +229,6 @@ struct CLIOptions: Sendable {
       --cfr[=N]                       Post-process to constant frame rate (default: 60 fps)
       --vfr                           Keep variable frame rate (skip CFR post-process)
       --codec h264|hevc               Video codec (default: prompt / h264)
-      --fps N                         Capture update rate hint (0=native refresh, default: 60)
       --duration SECONDS              Auto-stop after N seconds (non-interactive friendly)
       --out PATH                      Output file path (default: recs/screen-<ts>.mov)
       --open | --no-open              Open file when done (default: prompt in interactive mode)
