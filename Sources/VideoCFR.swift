@@ -331,7 +331,7 @@ enum VideoCFR {
       firstAudio: firstAudioSamples
     )
 
-    let progress = ProgressBar(prefix: "Transcoding", total: totalFramesEstimate)
+    let progress = ProgressBar(prefix: "", total: totalFramesEstimate)
     progress.startIfTTY()
 
     try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
@@ -406,6 +406,7 @@ final class ProgressBar: @unchecked Sendable {
   private let prefix: String
   private let total: Int64
   private var lastLen = 0
+  private var lastPct: Int = -1
   private var active = false
 
   init(prefix: String, total: Int64) {
@@ -423,10 +424,13 @@ final class ProgressBar: @unchecked Sendable {
     guard active else { return }
     let clamped = max(0, min(total, completed))
     let pct = Int((Double(clamped) / Double(total)) * 100.0)
+    if pct == lastPct { return }
+    lastPct = pct
     let width = 24
     let filled = Int((Double(width) * Double(clamped)) / Double(total))
     let bar = String(repeating: "#", count: filled) + String(repeating: ".", count: max(0, width - filled))
-    let s = "\(prefix) [\(bar)] \(pct)%"
+    let lead = prefix.isEmpty ? "" : "\(prefix) "
+    let s = "\(lead)[\(bar)] \(pct)%"
     let pad = max(0, lastLen - s.utf8.count)
     lastLen = s.utf8.count
     write("\r" + s + String(repeating: " ", count: pad))
@@ -435,8 +439,10 @@ final class ProgressBar: @unchecked Sendable {
   func stop() {
     guard active else { return }
     active = false
-    write("\r" + String(repeating: " ", count: max(0, lastLen)) + "\r")
-    write("\u{001B}[?25h\n") // show cursor + newline
+    // Render a final 100% bar so the user sees completion.
+    update(completed: total)
+    write("\n")
+    write("\u{001B}[?25h") // show cursor
   }
 
   private func write(_ s: String) {

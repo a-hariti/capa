@@ -303,19 +303,12 @@ struct ScreencapWizard {
     }
 
     if let cfrFPS {
-      print("Post-processing video to CFR \(cfrFPS) fps...")
-      let ppTicker = ElapsedTicker(prefix: "⏳")
-      ppTicker.startIfTTY()
-      var cfrOK = false
+      print("Post-processing video to \(cfrFPS) fps...")
       do {
         try await VideoCFR.rewriteInPlace(url: outFile, fps: cfrFPS)
-        cfrOK = true
       } catch {
-        ppTicker.stop()
         print("Warning: CFR post-process failed: \(error)")
       }
-      ppTicker.stop()
-      if cfrOK { print("CFR done.") }
     }
 
     print("Saved.")
@@ -326,6 +319,7 @@ struct ScreencapWizard {
       if includeSystemAudio { parts.append("qab=System") }
       print("Audio tracks (language tags): " + parts.joined(separator: ", "))
     }
+    print("")
     let shouldOpen: Bool
     if let openWhenDone = opts.openWhenDone {
       shouldOpen = openWhenDone
