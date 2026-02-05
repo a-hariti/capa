@@ -1,0 +1,10 @@
+capture-*
+gemini-work/
+recs/
+capa
+.build/
+.swiftpm/
+.home/
+
+__pycache__/
+*.pyc
