@@ -16,6 +16,9 @@ struct Capa: AsyncParsableCommand {
   @Flag(name: [.customLong("list-mics"), .customLong("list-microphones")], help: "List available microphones and exit")
   var listMicrophones = false
 
+  @Flag(name: [.customLong("list-cameras")], help: "List available cameras and exit")
+  var listCameras = false
+
   @Option(name: .customLong("display-index"), help: "Select display by index (from --list-displays)")
   var displayIndex: Int?
 
@@ -27,6 +30,15 @@ struct Capa: AsyncParsableCommand {
 
   @Option(name: .customLong("mic-id"), help: "Select microphone by AVCaptureDevice.uniqueID")
   var microphoneID: String?
+
+  @Flag(name: .customLong("camera"), help: "Record a secondary camera video track")
+  var cameraFlag = false
+
+  @Option(name: .customLong("camera-index"), help: "Select camera by index (from --list-cameras)")
+  var cameraIndex: Int?
+
+  @Option(name: .customLong("camera-id"), help: "Select camera by AVCaptureDevice.uniqueID")
+  var cameraID: String?
 
   @Flag(name: .customLong("system-audio"), help: "Capture system audio to a separate track")
   var systemAudioFlag = false
@@ -62,6 +74,9 @@ struct Capa: AsyncParsableCommand {
     if let microphoneIndex, microphoneIndex < 0 {
       throw ValidationError("--mic-index must be >= 0")
     }
+    if let cameraIndex, cameraIndex < 0 {
+      throw ValidationError("--camera-index must be >= 0")
+    }
     if openFlag && noOpenFlag {
       throw ValidationError("Cannot use --open and --no-open together.")
     }
@@ -91,6 +106,23 @@ struct Capa: AsyncParsableCommand {
       } else {
         for (i, d) in audioDevices.enumerated() {
           print("[\(i)] \(microphoneLabel(d)) id=\(d.uniqueID)")
+        }
+      }
+      return
+    }
+
+    if listCameras {
+      let videoDevices = AVCaptureDevice.DiscoverySession(
+        deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
+        mediaType: .video,
+        position: .unspecified
+      ).devices
+
+      if videoDevices.isEmpty {
+        print("(no cameras)")
+      } else {
+        for (i, d) in videoDevices.enumerated() {
+          print("[\(i)] \(cameraLabel(d)) id=\(d.uniqueID)")
         }
       }
       return
@@ -136,6 +168,12 @@ struct Capa: AsyncParsableCommand {
     let audioDevices = AVCaptureDevice.DiscoverySession(
       deviceTypes: [.microphone, .external],
       mediaType: .audio,
+      position: .unspecified
+    ).devices
+
+    let videoDevices = AVCaptureDevice.DiscoverySession(
+      deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera],
+      mediaType: .video,
       position: .unspecified
     ).devices
 
@@ -189,6 +227,46 @@ struct Capa: AsyncParsableCommand {
         print("System Settings -> Privacy & Security -> Microphone -> allow this binary.")
         includeMic = false
         audioDevice = nil
+      }
+    }
+
+    var cameraDevice: AVCaptureDevice?
+    var includeCamera = false
+    if cameraFlag || cameraIndex != nil || cameraID != nil {
+      includeCamera = true
+    }
+    if includeCamera {
+      if let idx = cameraIndex {
+        guard idx >= 0 && idx < videoDevices.count else {
+          print("Error: --camera-index out of range (0...\(max(0, videoDevices.count - 1)))")
+          return
+        }
+        cameraDevice = videoDevices[idx]
+      } else if let id = cameraID {
+        guard let d = videoDevices.first(where: { $0.uniqueID == id }) else {
+          print("Error: no camera with id \(id)")
+          return
+        }
+        cameraDevice = d
+      } else {
+        cameraDevice = videoDevices.first
+      }
+    } else if !nonInteractive, !videoDevices.isEmpty {
+      let options = ["No camera"] + videoDevices.map(cameraLabel)
+      let idx = selectOption(title: "Camera", options: options, defaultIndex: 0)
+      if idx > 0 {
+        includeCamera = true
+        cameraDevice = videoDevices[idx - 1]
+      }
+    }
+
+    if includeCamera {
+      let camGranted = await requestCameraAccess()
+      if !camGranted {
+        print("Camera permission not granted. Continuing without camera.")
+        print("System Settings -> Privacy & Security -> Camera -> allow this binary.")
+        includeCamera = false
+        cameraDevice = nil
       }
     }
 
@@ -261,6 +339,8 @@ struct Capa: AsyncParsableCommand {
       includeSystemAudio: includeSystemAudio,
       width: geometry.pixelWidth,
       height: geometry.pixelHeight,
+      includeCamera: includeCamera,
+      cameraDeviceID: cameraDevice?.uniqueID,
       onAudioLevel: onAudioLevel
     )
     let recorder = ScreenRecorder(filter: filter, options: recorderOptions)
@@ -277,6 +357,11 @@ struct Capa: AsyncParsableCommand {
       print("  Microphone: \(audioDevice.localizedName)")
     } else {
       print("  Microphone: none")
+    }
+    if includeCamera, let cameraDevice {
+      print("  Camera: \(cameraDevice.localizedName)")
+    } else {
+      print("  Camera: none")
     }
     print("  System audio: \(includeSystemAudio ? "on" : "off")")
     print("Output file: \(outFile.path)")
@@ -372,9 +457,9 @@ struct Capa: AsyncParsableCommand {
 
     if includeSystemAudio || includeMic {
       var parts: [String] = []
-      parts.append("qaa=Master (mixed)")
-      if includeMic { parts.append("qac=Mic") }
       if includeSystemAudio { parts.append("qab=System") }
+      if includeMic { parts.append("qac=Mic") }
+      parts.append("qaa=Master (mixed)")
       print("Audio tracks (language tags): " + parts.joined(separator: ", "))
     }
     print("")

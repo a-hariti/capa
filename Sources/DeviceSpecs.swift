@@ -65,3 +65,18 @@ func microphoneLabel(_ device: AVCaptureDevice) -> String {
   }
   return device.localizedName
 }
+
+func cameraLabel(_ device: AVCaptureDevice) -> String {
+  let fmt = device.activeFormat.formatDescription
+  let dims = CMVideoFormatDescriptionGetDimensions(fmt)
+  var extra: [String] = []
+  if dims.width > 0 && dims.height > 0 {
+    extra.append("\(dims.width)x\(dims.height)")
+  }
+  let ranges = device.activeFormat.videoSupportedFrameRateRanges
+  if let r = ranges.first, r.maxFrameRate > 0 {
+    extra.append(String(format: "%.0ffps", r.maxFrameRate))
+  }
+  if extra.isEmpty { return device.localizedName }
+  return "\(device.localizedName) (" + extra.joined(separator: ", ") + ")"
+}

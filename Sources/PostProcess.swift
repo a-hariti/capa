@@ -107,19 +107,16 @@ enum PostProcess {
       AVEncoderBitRateKey: 160_000,
     ]
 
-    // Put Master first so most players pick it as the default audio track.
-    let masterIn = AVAssetWriterInput(mediaType: .audio, outputSettings: aacSettings)
-    masterIn.expectsMediaDataInRealTime = false
-    masterIn.metadata = [trackTitle("Master")]
-    masterIn.languageCode = "qaa"
-    masterIn.extendedLanguageTag = "qaa-x-capa-master"
-    guard writer.canAdd(masterIn) else {
-      throw NSError(domain: "PostProcess", code: 12, userInfo: [NSLocalizedDescriptionKey: "Cannot add master audio input"])
+    // Prefer "original" audio first (system audio if present, then microphone).
+    let orderedSources = plan.sources.sorted { a, b in
+      let aIsSystem = (a.1 == "System Audio")
+      let bIsSystem = (b.1 == "System Audio")
+      if aIsSystem != bIsSystem { return aIsSystem }
+      return a.1 < b.1
     }
-    writer.add(masterIn)
 
     var sourceAudio: [(label: String, out: AVAssetReaderTrackOutput, input: AVAssetWriterInput)] = []
-    for (track, label) in plan.sources {
+    for (track, label) in orderedSources {
       let out = AVAssetReaderTrackOutput(track: track, outputSettings: pcmSettings)
       out.alwaysCopiesSampleData = false
       guard reader.canAdd(out) else {
@@ -143,6 +140,17 @@ enum PostProcess {
       writer.add(input)
       sourceAudio.append((label: label, out: out, input: input))
     }
+
+    // Add master last; it's primarily a reference mix for alignment in post.
+    let masterIn = AVAssetWriterInput(mediaType: .audio, outputSettings: aacSettings)
+    masterIn.expectsMediaDataInRealTime = false
+    masterIn.metadata = [trackTitle("Master (Mixed)")]
+    masterIn.languageCode = "qaa"
+    masterIn.extendedLanguageTag = "qaa-x-capa-master"
+    guard writer.canAdd(masterIn) else {
+      throw NSError(domain: "PostProcess", code: 12, userInfo: [NSLocalizedDescriptionKey: "Cannot add master audio input"])
+    }
+    writer.add(masterIn)
 
     guard reader.startReading() else {
       throw reader.error ?? NSError(domain: "PostProcess", code: 20, userInfo: [NSLocalizedDescriptionKey: "Reader failed to start"])

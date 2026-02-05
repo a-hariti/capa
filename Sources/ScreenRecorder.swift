@@ -10,7 +10,7 @@ import VideoToolbox
 /// - Capture in BGRA + sRGB (like Apple's examples / common app pipelines).
 /// - Use `AVOutputSettingsAssistant` as the baseline encoder config, then remove bitrate caps
 ///   and request max quality to avoid chroma starvation (the typical "washed out" symptom).
-final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
   enum AudioSource: Sendable {
     case microphone
     case system
@@ -26,6 +26,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     var width: Int
     var height: Int
 
+    /// Optional secondary video source (camera) written as a second video track.
+    var includeCamera: Bool = false
+    var cameraDeviceID: String?
+
     /// Called on the recorder's IO queue with a best-effort dBFS estimate.
     var onAudioLevel: (@Sendable (AudioSource, Float) -> Void)?
   }
@@ -35,15 +39,26 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     let type: SCStreamOutputType
   }
 
+  private struct UnsafeCameraSample: @unchecked Sendable {
+    let buffer: CMSampleBuffer
+  }
+
   private let filter: SCContentFilter
   private let options: Options
   private let ioQueue = DispatchQueue(label: "capa.screen-recorder.io")
+  private let cameraCallbackQueue = DispatchQueue(label: "capa.camera.callbacks")
 
   private var stream: SCStream?
+
+  private var cameraSession: AVCaptureSession?
+  private var cameraFormatHint: CMFormatDescription?
+  private var cameraDims: (w: Int, h: Int)?
 
   private var writer: AVAssetWriter?
   private var videoIn: AVAssetWriterInput?
   private var videoAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+  private var cameraVideoIn: AVAssetWriterInput?
+  private var cameraAdaptor: AVAssetWriterInputPixelBufferAdaptor?
   private var micAudioIn: AVAssetWriterInput?
   private var systemAudioIn: AVAssetWriterInput?
 
@@ -53,6 +68,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
   private var micQueueReadIndex: Int = 0
   private var systemQueue: [CMSampleBuffer] = []
   private var systemQueueReadIndex: Int = 0
+
+  // Buffer video samples until the writer session start time is known.
+  private var preStartScreen: [CMSampleBuffer] = []
+  private var preStartCamera: [CMSampleBuffer] = []
+  private var firstScreenSample: CMSampleBuffer?
+  private var firstCameraSample: CMSampleBuffer?
+
   private var isStopping = false
   private var lastPTS: CMTime = .zero
   private var sessionStartPTS: CMTime?
@@ -68,6 +90,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
       ioQueue.async {
         do {
           let s = try self.prepareStreamLocked()
+          try self.prepareCameraLockedIfNeeded()
+          self.startCameraLockedIfNeeded()
           cont.resume(returning: s)
         } catch {
           cont.resume(throwing: error)
@@ -89,6 +113,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     try await withCheckedThrowingContinuation { cont in
       ioQueue.async {
         do {
+          self.stopCameraLockedIfNeeded()
           // After capture is stopped, prevent any late enqueued samples from being processed.
           self.isStopping = true
           try self.finishLocked()
@@ -151,12 +176,20 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     self.writer = nil
     self.videoIn = nil
     self.videoAdaptor = nil
+    self.cameraVideoIn = nil
+    self.cameraAdaptor = nil
     self.micAudioIn = nil
     self.systemAudioIn = nil
     self.micQueue = []
     self.micQueueReadIndex = 0
     self.systemQueue = []
     self.systemQueueReadIndex = 0
+    self.preStartScreen = []
+    self.preStartCamera = []
+    self.firstScreenSample = nil
+    self.firstCameraSample = nil
+    self.cameraFormatHint = nil
+    self.cameraDims = nil
     self.failure = nil
     self.isStopping = false
     self.lastPTS = .zero
@@ -179,6 +212,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     default:
       break
     }
+  }
+
+  // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+
+  func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+    let sample = UnsafeCameraSample(buffer: sampleBuffer)
+    ioQueue.async { self.handleCameraLocked(sample: sample.buffer) }
   }
 
   private func frameStatus(_ sample: CMSampleBuffer) -> SCFrameStatus? {
@@ -207,9 +247,15 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     let pts = CMSampleBufferGetPresentationTimeStamp(sample)
 
     do {
-      if writer == nil {
-        try startWriterLocked(firstScreenSample: sample)
+      if sessionStartPTS == nil {
+        // Buffer until we can start the writer session (need camera's first sample too, if enabled).
+        enqueueVideoPreStart(sample: sample, into: &preStartScreen)
+        if firstScreenSample == nil { firstScreenSample = sample }
+        try startWriterIfReadyLocked()
+        return
       }
+
+      flushPreStartVideoLockedIfNeeded()
 
       guard let writer, let videoIn, let videoAdaptor else { return }
       guard writer.status == .writing else { return }
@@ -219,11 +265,158 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         throw writer.error ?? NSError(domain: "ScreenRecorder", code: 11, userInfo: [NSLocalizedDescriptionKey: "Video append failed (status: \(writer.status))"])
       }
 
-      lastPTS = pts
-      // Drain buffered audio opportunistically to keep A/V tightly synchronized.
+      lastPTS = max(lastPTS, pts)
       drainAudioLocked()
     } catch {
       failure = error
+    }
+  }
+
+  private func handleCameraLocked(sample: CMSampleBuffer) {
+    guard options.includeCamera else { return }
+    guard !isStopping else { return }
+    guard failure == nil else { return }
+    guard CMSampleBufferDataIsReady(sample) else { return }
+    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { return }
+
+    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+
+    do {
+      if sessionStartPTS == nil {
+        enqueueVideoPreStart(sample: sample, into: &preStartCamera)
+        if firstCameraSample == nil { firstCameraSample = sample }
+        try startWriterIfReadyLocked()
+        return
+      }
+
+      flushPreStartVideoLockedIfNeeded()
+
+      guard let writer, let cameraVideoIn, let cameraAdaptor else { return }
+      guard writer.status == .writing else { return }
+      guard cameraVideoIn.isReadyForMoreMediaData else { return }
+
+      if !cameraAdaptor.append(pixelBuffer, withPresentationTime: pts) {
+        throw writer.error ?? NSError(domain: "ScreenRecorder", code: 12, userInfo: [NSLocalizedDescriptionKey: "Camera video append failed (status: \(writer.status))"])
+      }
+
+      lastPTS = max(lastPTS, pts)
+    } catch {
+      failure = error
+    }
+  }
+
+  private func enqueueVideoPreStart(sample: CMSampleBuffer, into queue: inout [CMSampleBuffer]) {
+    let maxQueued = 300
+    queue.append(sample)
+    if queue.count > maxQueued {
+      queue.removeFirst(queue.count - maxQueued)
+    }
+  }
+
+  private func prepareCameraLockedIfNeeded() throws {
+    precondition(!Thread.isMainThread)
+    guard options.includeCamera else {
+      cameraSession = nil
+      return
+    }
+
+    let session = AVCaptureSession()
+    session.sessionPreset = .high
+
+    let device: AVCaptureDevice? = {
+      if let id = options.cameraDeviceID {
+        return AVCaptureDevice(uniqueID: id)
+      }
+      return AVCaptureDevice.default(for: .video)
+    }()
+
+    guard let device else {
+      throw NSError(domain: "ScreenRecorder", code: 80, userInfo: [NSLocalizedDescriptionKey: "Camera enabled but no camera device found"])
+    }
+
+    let fd = device.activeFormat.formatDescription
+    let dims = CMVideoFormatDescriptionGetDimensions(fd)
+    if dims.width > 0 && dims.height > 0 {
+      cameraFormatHint = fd
+      cameraDims = (w: Int(dims.width), h: Int(dims.height))
+    } else {
+      cameraFormatHint = fd
+      cameraDims = nil
+    }
+
+    let input = try AVCaptureDeviceInput(device: device)
+    guard session.canAddInput(input) else {
+      throw NSError(domain: "ScreenRecorder", code: 81, userInfo: [NSLocalizedDescriptionKey: "Cannot add camera input"])
+    }
+    session.addInput(input)
+
+    let output = AVCaptureVideoDataOutput()
+    output.videoSettings = [
+      kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+    ]
+    output.alwaysDiscardsLateVideoFrames = true
+    output.setSampleBufferDelegate(self, queue: cameraCallbackQueue)
+    guard session.canAddOutput(output) else {
+      throw NSError(domain: "ScreenRecorder", code: 82, userInfo: [NSLocalizedDescriptionKey: "Cannot add camera output"])
+    }
+    session.addOutput(output)
+
+    cameraSession = session
+  }
+
+  private func startCameraLockedIfNeeded() {
+    precondition(!Thread.isMainThread)
+    cameraSession?.startRunning()
+  }
+
+  private func stopCameraLockedIfNeeded() {
+    precondition(!Thread.isMainThread)
+    cameraSession?.stopRunning()
+  }
+
+  private func startWriterIfReadyLocked() throws {
+    precondition(!Thread.isMainThread)
+    guard sessionStartPTS == nil else { return }
+    guard writer == nil else { return } // writer/session start happen together
+    guard let firstScreenSample else { return }
+    let startPTS: CMTime = {
+      let s = CMSampleBufferGetPresentationTimeStamp(firstScreenSample)
+      if let c = firstCameraSample {
+        let cp = CMSampleBufferGetPresentationTimeStamp(c)
+        return min(s, cp)
+      }
+      return s
+    }()
+
+    try startWriterLocked(startPTS: startPTS, firstScreenSample: firstScreenSample)
+    flushPreStartVideoLockedIfNeeded()
+  }
+
+  private func flushPreStartVideoLockedIfNeeded() {
+    precondition(!Thread.isMainThread)
+    guard failure == nil else { return }
+    guard let writer, writer.status == .writing else { return }
+    guard let sessionStartPTS else { return }
+
+    func drain(queue: inout [CMSampleBuffer], input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor) {
+      while !queue.isEmpty && input.isReadyForMoreMediaData {
+        let s = queue.removeFirst()
+        let pts = CMSampleBufferGetPresentationTimeStamp(s)
+        if pts < sessionStartPTS { continue }
+        guard let pb = CMSampleBufferGetImageBuffer(s) else { continue }
+        if !adaptor.append(pb, withPresentationTime: pts) {
+          failure = writer.error ?? NSError(domain: "ScreenRecorder", code: 13, userInfo: [NSLocalizedDescriptionKey: "Video append failed (prestart)"])
+          return
+        }
+        lastPTS = max(lastPTS, pts)
+      }
+    }
+
+    if let videoIn, let videoAdaptor, !preStartScreen.isEmpty {
+      drain(queue: &preStartScreen, input: videoIn, adaptor: videoAdaptor)
+    }
+    if let cameraVideoIn, let cameraAdaptor, !preStartCamera.isEmpty {
+      drain(queue: &preStartCamera, input: cameraVideoIn, adaptor: cameraAdaptor)
     }
   }
 
@@ -297,7 +490,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
   }
 
-  private func startWriterLocked(firstScreenSample: CMSampleBuffer) throws {
+  private func startWriterLocked(startPTS: CMTime, firstScreenSample: CMSampleBuffer) throws {
     precondition(!Thread.isMainThread)
     guard let fmt = CMSampleBufferGetFormatDescription(firstScreenSample) else {
       throw NSError(domain: "ScreenRecorder", code: 30, userInfo: [NSLocalizedDescriptionKey: "Missing format description"])
@@ -362,6 +555,63 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     ]
     let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: videoIn, sourcePixelBufferAttributes: adaptorAttrs)
 
+    var cameraVideoIn: AVAssetWriterInput?
+    var cameraAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    if options.includeCamera {
+      guard let cameraFormatHint else {
+        throw NSError(domain: "ScreenRecorder", code: 35, userInfo: [NSLocalizedDescriptionKey: "Camera enabled but missing format hint"])
+      }
+      let (camW, camH): (Int, Int) = {
+        if let cameraDims { return (cameraDims.w, cameraDims.h) }
+        let d = CMVideoFormatDescriptionGetDimensions(cameraFormatHint)
+        return (Int(d.width), Int(d.height))
+      }()
+      guard camW > 0 && camH > 0 else {
+        throw NSError(domain: "ScreenRecorder", code: 36, userInfo: [NSLocalizedDescriptionKey: "Camera enabled but unknown dimensions"])
+      }
+
+      guard let assistant2 = AVOutputSettingsAssistant(preset: preset) else {
+        throw NSError(domain: "ScreenRecorder", code: 37, userInfo: [NSLocalizedDescriptionKey: "AVOutputSettingsAssistant unavailable for camera preset \(preset)"])
+      }
+      assistant2.sourceVideoFormat = cameraFormatHint
+      guard var camSettings = assistant2.videoSettings else {
+        throw NSError(domain: "ScreenRecorder", code: 38, userInfo: [NSLocalizedDescriptionKey: "Missing camera video settings"])
+      }
+
+      camSettings[AVVideoWidthKey] = camW
+      camSettings[AVVideoHeightKey] = camH
+      camSettings[AVVideoCodecKey] = options.videoCodec
+      if var compression = camSettings[AVVideoCompressionPropertiesKey] as? [String: Any] {
+        compression[kVTCompressionPropertyKey_RealTime as String] = true
+        compression[kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String] = false
+        compression[AVVideoMaxKeyFrameIntervalDurationKey] = 2.0
+        compression[AVVideoAllowFrameReorderingKey] = false
+        compression.removeValue(forKey: AVVideoAverageBitRateKey)
+        compression.removeValue(forKey: kVTCompressionPropertyKey_AverageBitRate as String)
+        compression.removeValue(forKey: kVTCompressionPropertyKey_DataRateLimits as String)
+        compression.removeValue(forKey: kVTCompressionPropertyKey_ConstantBitRate as String)
+        compression[kVTCompressionPropertyKey_Quality as String] = 1.0
+        camSettings[AVVideoCompressionPropertiesKey] = compression
+      }
+
+      let camIn = AVAssetWriterInput(mediaType: .video, outputSettings: camSettings, sourceFormatHint: cameraFormatHint)
+      camIn.expectsMediaDataInRealTime = true
+      guard writer.canAdd(camIn) else {
+        throw NSError(domain: "ScreenRecorder", code: 39, userInfo: [NSLocalizedDescriptionKey: "Cannot add camera video input"])
+      }
+      writer.add(camIn)
+
+      let camAdaptorAttrs: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+        kCVPixelBufferWidthKey as String: camW,
+        kCVPixelBufferHeightKey as String: camH,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+      ]
+      let camAdaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: camIn, sourcePixelBufferAttributes: camAdaptorAttrs)
+      cameraVideoIn = camIn
+      cameraAdaptor = camAdaptor
+    }
+
     var micAudioIn: AVAssetWriterInput?
     var systemAudioIn: AVAssetWriterInput?
     let audioSettings = assistant.audioSettings ?? [
@@ -400,12 +650,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     guard writer.startWriting() else {
       throw writer.error ?? NSError(domain: "ScreenRecorder", code: 34, userInfo: [NSLocalizedDescriptionKey: "Failed to start writing"])
     }
-    let startPTS = CMSampleBufferGetPresentationTimeStamp(firstScreenSample)
     writer.startSession(atSourceTime: startPTS)
 
     self.writer = writer
     self.videoIn = videoIn
     self.videoAdaptor = adaptor
+    self.cameraVideoIn = cameraVideoIn
+    self.cameraAdaptor = cameraAdaptor
     self.micAudioIn = micAudioIn
     self.systemAudioIn = systemAudioIn
     self.sessionStartPTS = startPTS
@@ -427,6 +678,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     videoIn?.markAsFinished()
+    cameraVideoIn?.markAsFinished()
     micAudioIn?.markAsFinished()
     systemAudioIn?.markAsFinished()
 
