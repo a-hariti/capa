@@ -98,6 +98,13 @@ struct ScreencapWizard {
       position: .unspecified
     ).devices
 
+    let includeSystemAudio: Bool
+    if opts.nonInteractive {
+      includeSystemAudio = opts.includeSystemAudio
+    } else {
+      includeSystemAudio = promptYesNo("Capture system audio to a separate track?", defaultYes: false)
+    }
+
     var audioDevice: AVCaptureDevice?
     var includeMic = false
     if opts.noMicrophone {
@@ -120,7 +127,10 @@ struct ScreencapWizard {
       includeMic = false
     } else if !audioDevices.isEmpty {
       let audioOptions = ["No microphone"] + audioDevices.map(microphoneLabel)
-      let audioIdx = selectOption(title: "Microphone", options: audioOptions, defaultIndex: 0)
+      let title = includeSystemAudio
+        ? "Microphone (optional; can sound echoey if it picks up speakers)"
+        : "Microphone"
+      let audioIdx = selectOption(title: title, options: audioOptions, defaultIndex: 0)
       if audioIdx > 0 {
         audioDevice = audioDevices[audioIdx - 1]
         includeMic = true
@@ -135,13 +145,6 @@ struct ScreencapWizard {
         includeMic = false
         audioDevice = nil
       }
-    }
-
-    let includeSystemAudio: Bool
-    if opts.nonInteractive {
-      includeSystemAudio = opts.includeSystemAudio
-    } else {
-      includeSystemAudio = promptYesNo("Capture system audio to a separate track?", defaultYes: false)
     }
 
     let codec: AVVideoCodecType
@@ -208,6 +211,9 @@ struct ScreencapWizard {
     }
     print("  System audio: \(includeSystemAudio ? "on" : "off")")
     print("Output file: \(outFile.path)")
+    if includeSystemAudio, includeMic {
+      print("Note: If playback sounds echoey, your microphone may be picking up speaker output. Use --no-mic, or mute the mic track in your player.")
+    }
     let canReadKeys = Terminal.isTTY(STDIN_FILENO)
     if canReadKeys {
       print("Recording... press 'q' to stop.")
