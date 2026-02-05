@@ -69,13 +69,26 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
   var index = min(max(defaultIndex, 0), options.count - 1)
   let lines = options.count + 2
 
+  func splitPrimarySecondary(_ text: String) -> (primary: String, secondary: String?) {
+    guard let open = text.lastIndex(of: "("), open > text.startIndex, text.hasSuffix(")") else {
+      return (text, nil)
+    }
+    let before = text[..<open]
+    guard before.last == " " else { return (text, nil) }
+    let primary = String(before.dropLast())
+    let secondary = String(text[open...])
+    return (primary, secondary)
+  }
+
   func render() {
     print(TUITheme.title("\(title):"))
     for i in 0..<options.count {
+      let parts = splitPrimarySecondary(options[i])
+      let secondary = parts.secondary.map { " " + TUITheme.muted($0) } ?? ""
       if i == index {
-        print("  \(TUITheme.accent(TUITheme.Glyph.pickerCaret, bold: true)) \(Ansi.bold)\(TUITheme.accent(options[i], bold: true))\(Ansi.reset)")
+        print("  \(TUITheme.accent(TUITheme.Glyph.pickerCaret, bold: true)) \(Ansi.bold)\(TUITheme.accent(parts.primary, bold: true))\(Ansi.reset)\(secondary)")
       } else {
-        print("    \(TUITheme.option(options[i]))")
+        print("    \(TUITheme.option(parts.primary))\(secondary)")
       }
     }
     let hint = "↑/↓ move\(TUITheme.Glyph.pickerHintSep)Enter select"
@@ -93,6 +106,17 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
     case .down:
       if index < options.count - 1 { index += 1 }
     case .enter:
+      // Collapse the menu into a single summary line.
+      print("\u{001B}[\(lines)A", terminator: "")
+      for n in 0..<lines {
+        print("\u{001B}[2K\r", terminator: "")
+        if n < lines - 1 {
+          print("\u{001B}[1B", terminator: "")
+        }
+      }
+      print("\u{001B}[\(lines - 1)A", terminator: "")
+      let picked = splitPrimarySecondary(options[index]).primary
+      print("\(TUITheme.title("\(title):")) \(TUITheme.option(picked))")
       print("")
       return index
     default:
