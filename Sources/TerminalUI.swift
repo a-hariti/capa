@@ -124,7 +124,7 @@ final class ElapsedTicker {
   private var lastPrintedLen: Int = 0
   private var cursorHidden = false
 
-  init(prefix: String = "🔴", toStderr: Bool = true) {
+  init(prefix: String = "⏺︎", toStderr: Bool = true) {
     self.prefix = prefix
     self.fd = toStderr ? stderr : stdout
   }
