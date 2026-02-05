@@ -48,6 +48,8 @@ enum PostProcess {
     let audioTracks = try await asset.loadTracks(withMediaType: .audio)
     let plan = planForTracks(audioTracks, includeSystemAudio: includeSystemAudio, includeMicrophone: includeMicrophone)
     guard plan.wantsMaster else { return }
+    // If there's only one source track, skip the master mix and keep the original audio as-is.
+    guard plan.sources.count > 1 else { return }
 
     let tmpURL = url.deletingLastPathComponent()
       .appendingPathComponent(".capa-tmp-\(UUID().uuidString).mov")
@@ -149,7 +151,22 @@ enum PostProcess {
     guard writer.startWriting() else {
       throw writer.error ?? NSError(domain: "PostProcess", code: 21, userInfo: [NSLocalizedDescriptionKey: "Writer failed to start"])
     }
-    writer.startSession(atSourceTime: .zero)
+    // Choose session start as the earliest PTS across video/audio to preserve offsets.
+    guard let firstVideo = videoOut.copyNextSampleBuffer() else {
+      throw NSError(domain: "PostProcess", code: 22, userInfo: [NSLocalizedDescriptionKey: "No video samples"])
+    }
+    var firstAudio: [CMSampleBuffer?] = []
+    firstAudio.reserveCapacity(sourceAudio.count)
+    var minPTS = CMSampleBufferGetPresentationTimeStamp(firstVideo)
+    for src in sourceAudio {
+      let s = src.out.copyNextSampleBuffer()
+      firstAudio.append(s)
+      if let s {
+        let pts = CMSampleBufferGetPresentationTimeStamp(s)
+        if pts < minPTS { minPTS = pts }
+      }
+    }
+    writer.startSession(atSourceTime: minPTS)
 
     // Drive writer readiness the idiomatic way (Apple docs): requestMediaDataWhenReady.
     // We coordinate all tracks from a single serial queue.
@@ -166,6 +183,7 @@ enum PostProcess {
         var label: String
         var out: AVAssetReaderTrackOutput
         var input: AVAssetWriterInput
+        var seed: CMSampleBuffer?
         var pending: [CMSampleBuffer] = []
         var segments: [Segment] = []
         var readEnd: Int64 = 0
@@ -189,6 +207,7 @@ enum PostProcess {
       var audioSignaled = false
       var videoSignaled = false
       var failure: Error?
+      var pendingVideo: CMSampleBuffer?
 
       init(
         writer: AVAssetWriter,
@@ -197,7 +216,9 @@ enum PostProcess {
         sources: [(label: String, out: AVAssetReaderTrackOutput, input: AVAssetWriterInput)],
         masterIn: AVAssetWriterInput,
         sampleRate: Int,
-        channels: Int
+        channels: Int,
+        firstVideo: CMSampleBuffer?,
+        firstAudio: [CMSampleBuffer?]
       ) {
         self.writer = writer
         self.videoOut = videoOut
@@ -208,6 +229,10 @@ enum PostProcess {
         self.channels = channels
         self.srScale = CMTimeScale(sampleRate)
         self.perSampleDuration = CMTime(value: 1, timescale: self.srScale)
+        self.pendingVideo = firstVideo
+        for (i, s) in firstAudio.enumerated() where i < self.sources.count {
+          self.sources[i].seed = s
+        }
       }
 
       func ptsToSamples(_ pts: CMTime) -> Int64 {
@@ -330,7 +355,14 @@ enum PostProcess {
         for i in sources.indices {
           if sources[i].finishedReading { continue }
           if sources[i].pending.count >= 32 { continue }
-          if let sbuf = sources[i].out.copyNextSampleBuffer() {
+          let sbuf: CMSampleBuffer?
+          if let seed = sources[i].seed {
+            sbuf = seed
+            sources[i].seed = nil
+          } else {
+            sbuf = sources[i].out.copyNextSampleBuffer()
+          }
+          if let sbuf {
             sources[i].pending.append(sbuf)
             let pts = CMSampleBufferGetPresentationTimeStamp(sbuf)
             let start = ptsToSamples(pts)
@@ -355,6 +387,7 @@ enum PostProcess {
 
       func mixChunk(startIndex: Int64, frames: Int) -> [Float] {
         var out = Array(repeating: Float(0), count: frames * channels)
+        let gain = 1.0 / Float(max(1, sources.count))
         for i in sources.indices {
           popExpiredSegments(for: i, before: startIndex)
           var remainingFrames = frames
@@ -381,7 +414,7 @@ enum PostProcess {
             let srcBase = segOffset * channels
             let dstBase = dstFrame * channels
             for s in 0..<(use * channels) {
-              out[dstBase + s] += seg.data[srcBase + s]
+              out[dstBase + s] += seg.data[srcBase + s] * gain
             }
             dstFrame += use
             remainingFrames -= use
@@ -482,7 +515,14 @@ enum PostProcess {
         }
         while videoIn.isReadyForMoreMediaData {
           if failIfNeeded() { break }
-          guard let sbuf = videoOut.copyNextSampleBuffer() else {
+          let sbuf: CMSampleBuffer?
+          if let pendingVideo {
+            sbuf = pendingVideo
+            self.pendingVideo = nil
+          } else {
+            sbuf = videoOut.copyNextSampleBuffer()
+          }
+          guard let sbuf else {
             videoIn.markAsFinished()
             videoDone = true
             return
@@ -504,7 +544,9 @@ enum PostProcess {
       sources: sourceAudio,
       masterIn: masterIn,
       sampleRate: Int(sampleRate),
-      channels: channels
+      channels: channels,
+      firstVideo: firstVideo,
+      firstAudio: firstAudio
     )
 
     try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
