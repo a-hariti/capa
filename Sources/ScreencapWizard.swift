@@ -211,9 +211,6 @@ struct ScreencapWizard {
     }
     print("  System audio: \(includeSystemAudio ? "on" : "off")")
     print("Output file: \(outFile.path)")
-    if includeSystemAudio, includeMic {
-      print("Note: If playback sounds echoey, your microphone may be picking up speaker output. Use --no-mic, or mute the mic track in your player.")
-    }
     let canReadKeys = Terminal.isTTY(STDIN_FILENO)
     if canReadKeys {
       print("Recording... press 'q' to stop.")
@@ -288,7 +285,7 @@ struct ScreencapWizard {
       print("Warning: failed to post-process audio tracks: \(error)")
     }
 
-    print("Saved: \(outFile.path)")
+    print("Saved.")
     if includeSystemAudio || includeMic {
       var parts: [String] = []
       parts.append("qaa=Master (mixed)")
