@@ -64,29 +64,66 @@ enum PostProcess {
   // MARK: - Implementation
 
   private static func rewriteWithMasterAudio(asset: AVAsset, plan: AudioPlan, outputURL: URL) async throws {
-    guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+    let videoTracks = try await asset.loadTracks(withMediaType: .video)
+    guard !videoTracks.isEmpty else {
       throw NSError(domain: "PostProcess", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing video track"])
     }
 
     let reader = try AVAssetReader(asset: asset)
     let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
 
-    // Video passthrough to preserve sharpness and exact encoding.
-    let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
-    videoOut.alwaysCopiesSampleData = false
-    guard reader.canAdd(videoOut) else {
-      throw NSError(domain: "PostProcess", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add video reader output"])
+    // Video passthrough to preserve sharpness and exact encoding (preserve all video tracks, e.g. screen + camera).
+    struct VideoPipe {
+      let title: String
+      let out: AVAssetReaderTrackOutput
+      let input: AVAssetWriterInput
     }
-    reader.add(videoOut)
 
-    let fds = try await videoTrack.load(.formatDescriptions)
-    let videoHint = fds.first
-    let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: videoHint)
-    videoIn.expectsMediaDataInRealTime = false
-    guard writer.canAdd(videoIn) else {
-      throw NSError(domain: "PostProcess", code: 3, userInfo: [NSLocalizedDescriptionKey: "Cannot add video writer input"])
+    // Label the largest track as "Screen"; if there are exactly two tracks, label the other "Camera".
+    var videoAreas: [(i: Int, area: Double)] = []
+    videoAreas.reserveCapacity(videoTracks.count)
+    for (i, t) in videoTracks.enumerated() {
+      let size = try await t.load(.naturalSize)
+      let xform = try await t.load(.preferredTransform)
+      let transformed = size.applying(xform)
+      let area = Double(abs(transformed.width) * abs(transformed.height))
+      videoAreas.append((i: i, area: area))
     }
-    writer.add(videoIn)
+    let sortedByArea = videoAreas.sorted { $0.area > $1.area }
+    let screenIndex = sortedByArea.first?.i ?? 0
+    let cameraIndex: Int? = (sortedByArea.count >= 2) ? sortedByArea[1].i : nil
+
+    var videoPipes: [VideoPipe] = []
+    videoPipes.reserveCapacity(videoTracks.count)
+    for (i, t) in videoTracks.enumerated() {
+      let title: String
+      if i == screenIndex {
+        title = "Screen"
+      } else if let cameraIndex, i == cameraIndex, videoTracks.count == 2 {
+        title = "Camera"
+      } else {
+        title = "Video \(i + 1)"
+      }
+
+      let out = AVAssetReaderTrackOutput(track: t, outputSettings: nil)
+      out.alwaysCopiesSampleData = false
+      guard reader.canAdd(out) else {
+        throw NSError(domain: "PostProcess", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add video reader output (\(title))"])
+      }
+      reader.add(out)
+
+      let hint = (try await t.load(.formatDescriptions)).first
+      let input = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: hint)
+      input.expectsMediaDataInRealTime = false
+      input.transform = try await t.load(.preferredTransform)
+      input.metadata = [trackTitle(title)]
+      guard writer.canAdd(input) else {
+        throw NSError(domain: "PostProcess", code: 3, userInfo: [NSLocalizedDescriptionKey: "Cannot add video writer input (\(title))"])
+      }
+      writer.add(input)
+
+      videoPipes.append(VideoPipe(title: title, out: out, input: input))
+    }
 
     // Decode audio to a common PCM format for mixing and re-encode sources + master to AAC.
     let sampleRate: Double = 48_000
@@ -107,13 +144,8 @@ enum PostProcess {
       AVEncoderBitRateKey: 160_000,
     ]
 
-    // Prefer "original" audio first (system audio if present, then microphone).
-    let orderedSources = plan.sources.sorted { a, b in
-      let aIsSystem = (a.1 == "System Audio")
-      let bIsSystem = (b.1 == "System Audio")
-      if aIsSystem != bIsSystem { return aIsSystem }
-      return a.1 < b.1
-    }
+    // Keep the original writer ordering: microphone first, then system audio.
+    let orderedSources = plan.sources
 
     var sourceAudio: [(label: String, out: AVAssetReaderTrackOutput, input: AVAssetWriterInput)] = []
     for (track, label) in orderedSources {
@@ -159,12 +191,21 @@ enum PostProcess {
       throw writer.error ?? NSError(domain: "PostProcess", code: 21, userInfo: [NSLocalizedDescriptionKey: "Writer failed to start"])
     }
     // Choose session start as the earliest PTS across video/audio to preserve offsets.
-    guard let firstVideo = videoOut.copyNextSampleBuffer() else {
-      throw NSError(domain: "PostProcess", code: 22, userInfo: [NSLocalizedDescriptionKey: "No video samples"])
+    var firstVideo: [CMSampleBuffer] = []
+    firstVideo.reserveCapacity(videoPipes.count)
+    for p in videoPipes {
+      guard let s = p.out.copyNextSampleBuffer() else {
+        throw NSError(domain: "PostProcess", code: 22, userInfo: [NSLocalizedDescriptionKey: "No video samples (\(p.title))"])
+      }
+      firstVideo.append(s)
     }
     var firstAudio: [CMSampleBuffer?] = []
     firstAudio.reserveCapacity(sourceAudio.count)
-    var minPTS = CMSampleBufferGetPresentationTimeStamp(firstVideo)
+    var minPTS = CMSampleBufferGetPresentationTimeStamp(firstVideo[0])
+    for s in firstVideo.dropFirst() {
+      let pts = CMSampleBufferGetPresentationTimeStamp(s)
+      if pts < minPTS { minPTS = pts }
+    }
     for src in sourceAudio {
       let s = src.out.copyNextSampleBuffer()
       firstAudio.append(s)
@@ -198,8 +239,15 @@ enum PostProcess {
       }
 
       let writer: AVAssetWriter
-      let videoOut: AVAssetReaderTrackOutput
-      let videoIn: AVAssetWriterInput
+      struct VideoSource {
+        var title: String
+        var out: AVAssetReaderTrackOutput
+        var input: AVAssetWriterInput
+        var seed: CMSampleBuffer?
+        var done = false
+        var signaled = false
+      }
+      var videos: [VideoSource]
       var sources: [AudioSource]
       let masterIn: AVAssetWriterInput
       let sampleRate: Int
@@ -210,33 +258,30 @@ enum PostProcess {
 
       var masterIndex: Int64 = 0
       var audioDone = false
-      var videoDone = false
       var audioSignaled = false
-      var videoSignaled = false
       var failure: Error?
-      var pendingVideo: CMSampleBuffer?
 
       init(
         writer: AVAssetWriter,
-        videoOut: AVAssetReaderTrackOutput,
-        videoIn: AVAssetWriterInput,
+        video: [VideoPipe],
         sources: [(label: String, out: AVAssetReaderTrackOutput, input: AVAssetWriterInput)],
         masterIn: AVAssetWriterInput,
         sampleRate: Int,
         channels: Int,
-        firstVideo: CMSampleBuffer?,
+        firstVideo: [CMSampleBuffer],
         firstAudio: [CMSampleBuffer?]
       ) {
         self.writer = writer
-        self.videoOut = videoOut
-        self.videoIn = videoIn
+        precondition(video.count == firstVideo.count)
+        self.videos = zip(video, firstVideo).map { pipe, first in
+          VideoSource(title: pipe.title, out: pipe.out, input: pipe.input, seed: first)
+        }
         self.sources = sources.map { AudioSource(label: $0.label, out: $0.out, input: $0.input) }
         self.masterIn = masterIn
         self.sampleRate = sampleRate
         self.channels = channels
         self.srScale = CMTimeScale(sampleRate)
         self.perSampleDuration = CMTime(value: 1, timescale: self.srScale)
-        self.pendingVideo = firstVideo
         for (i, s) in firstAudio.enumerated() where i < self.sources.count {
           self.sources[i].seed = s
         }
@@ -513,31 +558,31 @@ enum PostProcess {
         }
       }
 
-      func stepVideo() {
-        if videoDone { return }
+      func stepVideo(i: Int) {
+        if videos[i].done { return }
         if failIfNeeded() {
-          videoIn.markAsFinished()
-          videoDone = true
+          videos[i].input.markAsFinished()
+          videos[i].done = true
           return
         }
-        while videoIn.isReadyForMoreMediaData {
+        while videos[i].input.isReadyForMoreMediaData {
           if failIfNeeded() { break }
           let sbuf: CMSampleBuffer?
-          if let pendingVideo {
-            sbuf = pendingVideo
-            self.pendingVideo = nil
+          if let seed = videos[i].seed {
+            sbuf = seed
+            videos[i].seed = nil
           } else {
-            sbuf = videoOut.copyNextSampleBuffer()
+            sbuf = videos[i].out.copyNextSampleBuffer()
           }
           guard let sbuf else {
-            videoIn.markAsFinished()
-            videoDone = true
+            videos[i].input.markAsFinished()
+            videos[i].done = true
             return
           }
-          if !videoIn.append(sbuf) {
-            failure = writer.error ?? NSError(domain: "PostProcess", code: 30, userInfo: [NSLocalizedDescriptionKey: "Video append failed"])
-            videoIn.markAsFinished()
-            videoDone = true
+          if !videos[i].input.append(sbuf) {
+            failure = writer.error ?? NSError(domain: "PostProcess", code: 30, userInfo: [NSLocalizedDescriptionKey: "Video append failed (\(videos[i].title))"])
+            videos[i].input.markAsFinished()
+            videos[i].done = true
             return
           }
         }
@@ -546,8 +591,7 @@ enum PostProcess {
 
     let driver = Driver(
       writer: writer,
-      videoOut: videoOut,
-      videoIn: videoIn,
+      video: videoPipes,
       sources: sourceAudio,
       masterIn: masterIn,
       sampleRate: Int(sampleRate),
@@ -560,16 +604,17 @@ enum PostProcess {
       final class AwaitState: @unchecked Sendable {
         let cont: CheckedContinuation<Void, any Error>
         let driver: Driver
-        var remaining = 2
+        var remaining: Int
         var finished = false
 
-        init(cont: CheckedContinuation<Void, any Error>, driver: Driver) {
+        init(cont: CheckedContinuation<Void, any Error>, driver: Driver, remaining: Int) {
           self.cont = cont
           self.driver = driver
+          self.remaining = remaining
         }
       }
 
-      let state = AwaitState(cont: cont, driver: driver)
+      let state = AwaitState(cont: cont, driver: driver, remaining: driver.videos.count + 1)
 
       let finish: @Sendable (Error?) -> Void = { error in
         guard !state.finished else { return }
@@ -589,12 +634,14 @@ enum PostProcess {
       }
 
       // All callbacks are executed on `q` by AVFoundation.
-      driver.videoIn.requestMediaDataWhenReady(on: q) {
-        driver.stepVideo()
-        if let err = driver.failure { finish(err); return }
-        if driver.videoDone, !driver.videoSignaled {
-          driver.videoSignaled = true
-          partDone()
+      for i in 0..<driver.videos.count {
+        driver.videos[i].input.requestMediaDataWhenReady(on: q) {
+          driver.stepVideo(i: i)
+          if let err = driver.failure { finish(err); return }
+          if driver.videos[i].done, !driver.videos[i].signaled {
+            driver.videos[i].signaled = true
+            partDone()
+          }
         }
       }
 

@@ -9,7 +9,8 @@ enum VideoCFR {
   static func rewriteInPlace(url: URL, fps: Int) async throws {
     let asset = AVURLAsset(url: url)
 
-    guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+    let videoTracks = try await asset.loadTracks(withMediaType: .video)
+    guard !videoTracks.isEmpty else {
       throw NSError(domain: "VideoCFR", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing video track"])
     }
     let audioTracks = try await asset.loadTracks(withMediaType: .audio)
@@ -17,17 +18,25 @@ enum VideoCFR {
     let tmpURL = url.deletingLastPathComponent()
       .appendingPathComponent(".capa-cfr-\(UUID().uuidString).mov")
 
-    try await rewrite(asset: asset, videoTrack: videoTrack, audioTracks: audioTracks, outputURL: tmpURL, fps: fps)
+    try await rewrite(asset: asset, videoTracks: videoTracks, audioTracks: audioTracks, outputURL: tmpURL, fps: fps)
 
     let fm = FileManager.default
     _ = try? fm.replaceItemAt(url, withItemAt: tmpURL, backupItemName: nil, options: .usingNewMetadataOnly)
+  }
+
+  private static func trackTitle(_ title: String) -> AVMetadataItem {
+    let item = AVMutableMetadataItem()
+    item.identifier = .quickTimeUserDataTrackName
+    item.value = title as NSString
+    item.dataType = kCMMetadataBaseDataType_UTF8 as String
+    return item
   }
 
   // MARK: - Implementation
 
   private static func rewrite(
     asset: AVAsset,
-    videoTrack: AVAssetTrack,
+    videoTracks: [AVAssetTrack],
     audioTracks: [AVAssetTrack],
     outputURL: URL,
     fps: Int
@@ -35,72 +44,106 @@ enum VideoCFR {
     let reader = try AVAssetReader(asset: asset)
     let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
 
-    // Video decode -> pixel buffers.
-    let videoOutSettings: [String: Any] = [
-      kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-    ]
-    let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: videoOutSettings)
-    videoOut.alwaysCopiesSampleData = false
-    guard reader.canAdd(videoOut) else {
-      throw NSError(domain: "VideoCFR", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add video reader output"])
-    }
-    reader.add(videoOut)
-
-    // Determine codec from the existing track (preserve codec family).
-    let videoFormatDescriptions = try await videoTrack.load(.formatDescriptions)
-    let videoCodec: AVVideoCodecType = {
-      guard let fd = videoFormatDescriptions.first else { return .h264 }
-      let sub = CMFormatDescriptionGetMediaSubType(fd)
-      return (sub == kCMVideoCodecType_HEVC) ? .hevc : .h264
-    }()
-
-    // Use Apple-tuned defaults then let it "breathe" (same approach as live recorder).
-    let preset: AVOutputSettingsPreset = (videoCodec == .hevc) ? .hevc3840x2160 : .preset3840x2160
-    guard let assistant = AVOutputSettingsAssistant(preset: preset) else {
-      throw NSError(domain: "VideoCFR", code: 3, userInfo: [NSLocalizedDescriptionKey: "AVOutputSettingsAssistant unavailable"])
+    struct VideoSetup {
+      let out: AVAssetReaderTrackOutput
+      let input: AVAssetWriterInput
+      let adaptor: AVAssetWriterInputPixelBufferAdaptor
     }
 
-    let naturalSize = try await videoTrack.load(.naturalSize)
-    let preferredTransform = try await videoTrack.load(.preferredTransform)
-    let transformed = naturalSize.applying(preferredTransform)
-    let width = Int(abs(transformed.width).rounded())
-    let height = Int(abs(transformed.height).rounded())
-
-    guard var videoSettings = assistant.videoSettings else {
-      throw NSError(domain: "VideoCFR", code: 4, userInfo: [NSLocalizedDescriptionKey: "Missing assistant video settings"])
+    // Label tracks consistently for editors: largest is "Screen", second (if exactly two) is "Camera".
+    var videoAreas: [(i: Int, area: Double)] = []
+    videoAreas.reserveCapacity(videoTracks.count)
+    for (i, t) in videoTracks.enumerated() {
+      let size = try await t.load(.naturalSize)
+      let xform = try await t.load(.preferredTransform)
+      let transformed = size.applying(xform)
+      let area = Double(abs(transformed.width) * abs(transformed.height))
+      videoAreas.append((i: i, area: area))
     }
-    videoSettings[AVVideoWidthKey] = width
-    videoSettings[AVVideoHeightKey] = height
-    videoSettings[AVVideoCodecKey] = videoCodec
-    if var compression = videoSettings[AVVideoCompressionPropertiesKey] as? [String: Any] {
-      compression[kVTCompressionPropertyKey_RealTime as String] = false
-      compression[kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String] = false
-      compression[AVVideoExpectedSourceFrameRateKey] = max(1, min(240, fps))
-      compression[AVVideoMaxKeyFrameIntervalKey] = max(1, min(240, fps)) * 2
-      compression[AVVideoAllowFrameReorderingKey] = false
-
-      compression.removeValue(forKey: AVVideoAverageBitRateKey)
-      compression.removeValue(forKey: kVTCompressionPropertyKey_AverageBitRate as String)
-      compression.removeValue(forKey: kVTCompressionPropertyKey_DataRateLimits as String)
-      compression.removeValue(forKey: kVTCompressionPropertyKey_ConstantBitRate as String)
-      compression[kVTCompressionPropertyKey_Quality as String] = 1.0
-      videoSettings[AVVideoCompressionPropertiesKey] = compression
+    let sortedByArea = videoAreas.sorted { $0.area > $1.area }
+    let screenIndex = sortedByArea.first?.i ?? 0
+    let cameraIndex: Int? = (sortedByArea.count >= 2) ? sortedByArea[1].i : nil
+    let videoTitles: [String] = videoTracks.indices.map { i in
+      if i == screenIndex { return "Screen" }
+      if let cameraIndex, i == cameraIndex, videoTracks.count == 2 { return "Camera" }
+      return "Video \(i + 1)"
     }
 
-    let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-    videoIn.expectsMediaDataInRealTime = false
-    guard writer.canAdd(videoIn) else {
-      throw NSError(domain: "VideoCFR", code: 5, userInfo: [NSLocalizedDescriptionKey: "Cannot add video writer input"])
-    }
-    writer.add(videoIn)
+    var videoSetups: [VideoSetup] = []
+    videoSetups.reserveCapacity(videoTracks.count)
 
-    let adaptorAttrs: [String: Any] = [
-      kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-      kCVPixelBufferWidthKey as String: width,
-      kCVPixelBufferHeightKey as String: height,
-      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-    ]
-    let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: videoIn, sourcePixelBufferAttributes: adaptorAttrs)
+    // Video decode -> pixel buffers, one pipe per video track.
+    for (i, track) in videoTracks.enumerated() {
+      let videoOutSettings: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+      ]
+      let out = AVAssetReaderTrackOutput(track: track, outputSettings: videoOutSettings)
+      out.alwaysCopiesSampleData = false
+      guard reader.canAdd(out) else {
+        throw NSError(domain: "VideoCFR", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add video reader output"])
+      }
+      reader.add(out)
+
+      // Determine codec from the existing track (preserve codec family).
+      let videoFormatDescriptions = try await track.load(.formatDescriptions)
+      let videoCodec: AVVideoCodecType = {
+        guard let fd = videoFormatDescriptions.first else { return .h264 }
+        let sub = CMFormatDescriptionGetMediaSubType(fd)
+        return (sub == kCMVideoCodecType_HEVC) ? .hevc : .h264
+      }()
+
+      // Use Apple-tuned defaults then let it "breathe" (same approach as live recorder).
+      let preset: AVOutputSettingsPreset = (videoCodec == .hevc) ? .hevc3840x2160 : .preset3840x2160
+      guard let assistant = AVOutputSettingsAssistant(preset: preset) else {
+        throw NSError(domain: "VideoCFR", code: 3, userInfo: [NSLocalizedDescriptionKey: "AVOutputSettingsAssistant unavailable"])
+      }
+
+      let naturalSize = try await track.load(.naturalSize)
+      let preferredTransform = try await track.load(.preferredTransform)
+      // Decode outputs pixel buffers in encoded orientation; preserve the original transform metadata.
+      let width = Int(abs(naturalSize.width).rounded())
+      let height = Int(abs(naturalSize.height).rounded())
+
+      guard var videoSettings = assistant.videoSettings else {
+        throw NSError(domain: "VideoCFR", code: 4, userInfo: [NSLocalizedDescriptionKey: "Missing assistant video settings"])
+      }
+      videoSettings[AVVideoWidthKey] = width
+      videoSettings[AVVideoHeightKey] = height
+      videoSettings[AVVideoCodecKey] = videoCodec
+      if var compression = videoSettings[AVVideoCompressionPropertiesKey] as? [String: Any] {
+        compression[kVTCompressionPropertyKey_RealTime as String] = false
+        compression[kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality as String] = false
+        compression[AVVideoExpectedSourceFrameRateKey] = max(1, min(240, fps))
+        compression[AVVideoMaxKeyFrameIntervalKey] = max(1, min(240, fps)) * 2
+        compression[AVVideoAllowFrameReorderingKey] = false
+
+        compression.removeValue(forKey: AVVideoAverageBitRateKey)
+        compression.removeValue(forKey: kVTCompressionPropertyKey_AverageBitRate as String)
+        compression.removeValue(forKey: kVTCompressionPropertyKey_DataRateLimits as String)
+        compression.removeValue(forKey: kVTCompressionPropertyKey_ConstantBitRate as String)
+        compression[kVTCompressionPropertyKey_Quality as String] = 1.0
+        videoSettings[AVVideoCompressionPropertiesKey] = compression
+      }
+
+      let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+      input.expectsMediaDataInRealTime = false
+      input.transform = preferredTransform
+      input.metadata = [trackTitle(videoTitles[i])]
+      guard writer.canAdd(input) else {
+        throw NSError(domain: "VideoCFR", code: 5, userInfo: [NSLocalizedDescriptionKey: "Cannot add video writer input"])
+      }
+      writer.add(input)
+
+      let adaptorAttrs: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+        kCVPixelBufferWidthKey as String: width,
+        kCVPixelBufferHeightKey as String: height,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+      ]
+      let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: adaptorAttrs)
+
+      videoSetups.append(VideoSetup(out: out, input: input, adaptor: adaptor))
+    }
 
     // Audio passthrough: keep all embedded audio tracks exactly as recorded.
     struct AudioPipe {
@@ -131,16 +174,25 @@ enum VideoCFR {
       throw writer.error ?? NSError(domain: "VideoCFR", code: 7, userInfo: [NSLocalizedDescriptionKey: "Writer failed to start"])
     }
 
-    // Choose session start as the earliest PTS across video/audio to allow passthrough.
-    let firstVideo = videoOut.copyNextSampleBuffer()
-    guard let firstVideo else {
-      throw NSError(domain: "VideoCFR", code: 8, userInfo: [NSLocalizedDescriptionKey: "No video samples"])
+    // Pull first sample for each video track to seed the CFR timeline.
+    var firstVideoSamples: [CMSampleBuffer] = []
+    firstVideoSamples.reserveCapacity(videoSetups.count)
+    for setup in videoSetups {
+      guard let first = setup.out.copyNextSampleBuffer() else {
+        throw NSError(domain: "VideoCFR", code: 8, userInfo: [NSLocalizedDescriptionKey: "No video samples"])
+      }
+      firstVideoSamples.append(first)
     }
-    let firstVideoPTS = CMSampleBufferGetPresentationTimeStamp(firstVideo)
+
+    // Choose session start as the earliest PTS across video/audio to allow passthrough.
+    var minPTS = CMSampleBufferGetPresentationTimeStamp(firstVideoSamples[0])
+    for s in firstVideoSamples.dropFirst() {
+      let pts = CMSampleBufferGetPresentationTimeStamp(s)
+      if pts < minPTS { minPTS = pts }
+    }
 
     var firstAudioSamples: [CMSampleBuffer?] = []
     firstAudioSamples.reserveCapacity(audioPipes.count)
-    var minPTS = firstVideoPTS
     for pipe in audioPipes {
       let s = pipe.out.copyNextSampleBuffer()
       firstAudioSamples.append(s)
@@ -161,15 +213,19 @@ enum VideoCFR {
       let startPTS: CMTime
       let endPTS: CMTime
 
-      let videoOut: AVAssetReaderTrackOutput
-      let videoIn: AVAssetWriterInput
-      let adaptor: AVAssetWriterInputPixelBufferAdaptor
+      struct VideoState {
+        let out: AVAssetReaderTrackOutput
+        let input: AVAssetWriterInput
+        let adaptor: AVAssetWriterInputPixelBufferAdaptor
+        var next: CMSampleBuffer?
+        var lastPixel: CVPixelBuffer?
+        var nextPTS: CMTime = .invalid
+        var frameIndex: Int64 = 0
+        var done = false
+        var signaled = false
+      }
 
-      var nextVideo: CMSampleBuffer?
-      var lastPixel: CVPixelBuffer?
-      var nextVideoPTS: CMTime = .invalid
-      var frameIndex: Int64 = 0
-      var videoDone = false
+      var videos: [VideoState]
 
       var audio: [AudioPipe]
       var nextAudio: [CMSampleBuffer?]
@@ -185,10 +241,8 @@ enum VideoCFR {
         fps: Int,
         startPTS: CMTime,
         endPTS: CMTime,
-        videoOut: AVAssetReaderTrackOutput,
-        videoIn: AVAssetWriterInput,
-        adaptor: AVAssetWriterInputPixelBufferAdaptor,
-        firstVideo: CMSampleBuffer,
+        videoSetups: [VideoSetup],
+        firstVideo: [CMSampleBuffer],
         audio: [AudioPipe],
         firstAudio: [CMSampleBuffer?]
       ) {
@@ -197,12 +251,13 @@ enum VideoCFR {
         self.fps = fps
         self.startPTS = startPTS
         self.endPTS = endPTS
-        self.videoOut = videoOut
-        self.videoIn = videoIn
-        self.adaptor = adaptor
-        self.nextVideo = firstVideo
-        if let pb = CMSampleBufferGetImageBuffer(firstVideo) {
-          self.lastPixel = pb
+        precondition(videoSetups.count == firstVideo.count)
+        self.videos = zip(videoSetups, firstVideo).map { setup, first in
+          var vs = VideoState(out: setup.out, input: setup.input, adaptor: setup.adaptor, next: first, lastPixel: nil)
+          if let pb = CMSampleBufferGetImageBuffer(first) {
+            vs.lastPixel = pb
+          }
+          return vs
         }
         self.audio = audio
         self.nextAudio = firstAudio
@@ -255,57 +310,57 @@ enum VideoCFR {
         }
       }
 
-      func stepVideo() {
-        if videoDone { return }
+      func stepVideo(i: Int) {
+        if videos[i].done { return }
         if failIfNeeded() {
-          videoIn.markAsFinished()
-          videoDone = true
+          videos[i].input.markAsFinished()
+          videos[i].done = true
           return
         }
 
         let frameDur = CMTime(value: 1, timescale: CMTimeScale(max(1, min(240, fps))))
 
-        while videoIn.isReadyForMoreMediaData {
+        while videos[i].input.isReadyForMoreMediaData {
           if failIfNeeded() { break }
 
-          let t = startPTS + CMTimeMultiply(frameDur, multiplier: Int32(frameIndex))
+          let t = startPTS + CMTimeMultiply(frameDur, multiplier: Int32(videos[i].frameIndex))
           if t > endPTS {
-            videoIn.markAsFinished()
-            videoDone = true
+            videos[i].input.markAsFinished()
+            videos[i].done = true
             return
           }
 
           // Pull forward until nextVideoPTS > t.
-          if nextVideoPTS == .invalid, let nextVideo {
-            nextVideoPTS = CMSampleBufferGetPresentationTimeStamp(nextVideo)
+          if videos[i].nextPTS == .invalid, let next = videos[i].next {
+            videos[i].nextPTS = CMSampleBufferGetPresentationTimeStamp(next)
           }
-          while let next = nextVideo, nextVideoPTS <= t {
+          while let next = videos[i].next, videos[i].nextPTS <= t {
             if let pb = CMSampleBufferGetImageBuffer(next) {
-              lastPixel = pb
+              videos[i].lastPixel = pb
             }
-            nextVideo = videoOut.copyNextSampleBuffer()
-            if let nextVideo {
-              nextVideoPTS = CMSampleBufferGetPresentationTimeStamp(nextVideo)
+            videos[i].next = videos[i].out.copyNextSampleBuffer()
+            if let n = videos[i].next {
+              videos[i].nextPTS = CMSampleBufferGetPresentationTimeStamp(n)
             } else {
-              nextVideoPTS = .positiveInfinity
+              videos[i].nextPTS = .positiveInfinity
               break
             }
           }
 
-          guard let lastPixel else {
+          guard let lastPixel = videos[i].lastPixel else {
             // Still nothing decoded; advance.
-            frameIndex += 1
+            videos[i].frameIndex += 1
             continue
           }
 
-          if !adaptor.append(lastPixel, withPresentationTime: t) {
+          if !videos[i].adaptor.append(lastPixel, withPresentationTime: t) {
             failure = writer.error ?? NSError(domain: "VideoCFR", code: 23, userInfo: [NSLocalizedDescriptionKey: "Video append failed"])
-            videoIn.markAsFinished()
-            videoDone = true
+            videos[i].input.markAsFinished()
+            videos[i].done = true
             return
           }
 
-          frameIndex += 1
+          videos[i].frameIndex += 1
         }
       }
     }
@@ -322,10 +377,8 @@ enum VideoCFR {
       fps: fps,
       startPTS: minPTS,
       endPTS: endPTS,
-      videoOut: videoOut,
-      videoIn: videoIn,
-      adaptor: adaptor,
-      firstVideo: firstVideo,
+      videoSetups: videoSetups,
+      firstVideo: firstVideoSamples,
       audio: audioPipes,
       firstAudio: firstAudioSamples
     )
@@ -347,7 +400,7 @@ enum VideoCFR {
         }
       }
 
-      let awaitState = AwaitState(cont: cont, state: state, remaining: 1 + audioPipes.count)
+      let awaitState = AwaitState(cont: cont, state: state, remaining: state.videos.count + audioPipes.count)
 
       let finish: @Sendable (Error?) -> Void = { error in
         guard !awaitState.finished else { return }
@@ -366,13 +419,15 @@ enum VideoCFR {
         }
       }
 
-      state.videoIn.requestMediaDataWhenReady(on: q) {
-        state.stepVideo()
-        progress.update(completed: state.frameIndex)
-        if let err = state.failure { finish(err); return }
-        if state.videoDone, !state.videoSignaled {
-          state.videoSignaled = true
-          partDone()
+      for i in 0..<state.videos.count {
+        state.videos[i].input.requestMediaDataWhenReady(on: q) {
+          state.stepVideo(i: i)
+          progress.update(completed: state.videos.first?.frameIndex ?? 0)
+          if let err = state.failure { finish(err); return }
+          if state.videos[i].done && !state.videos[i].signaled {
+            state.videos[i].signaled = true
+            partDone()
+          }
         }
       }
 
