@@ -20,6 +20,8 @@ struct CLIOptions: Sendable {
 
   /// Post-process video into CFR at the given FPS (e.g. 60). `nil` means keep VFR.
   var cfrFPS: Int?
+  /// Keep variable frame rate timestamps (skip CFR post-process).
+  var keepVFR = false
 
   var codec: AVVideoCodecType?
   /// `0` means "native refresh rate" (passes `kCMTimeZero` to ScreenCaptureKit).
@@ -116,6 +118,12 @@ struct CLIOptions: Sendable {
 
       if a == "--system-audio" {
         out.includeSystemAudio = true
+        i += 1
+        continue
+      }
+
+      if a == "--vfr" {
+        out.keepVFR = true
         i += 1
         continue
       }
@@ -256,6 +264,7 @@ struct CLIOptions: Sendable {
       --mic-id ID                     Select microphone by AVCaptureDevice.uniqueID
       --system-audio                  Capture system audio to a separate track
       --cfr[=N]                       Post-process to constant frame rate (default: 60 fps)
+      --vfr                           Keep variable frame rate (skip CFR post-process)
       --codec h264|hevc               Video codec (default: prompt / h264)
       --fps N                         Capture update rate hint (0=native refresh, default: 60)
       --duration SECONDS              Auto-stop after N seconds (non-interactive friendly)

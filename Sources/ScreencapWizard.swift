@@ -162,17 +162,13 @@ struct ScreencapWizard {
     }
 
     let cfrFPS: Int?
-    if let v = opts.cfrFPS {
-      cfrFPS = v
-    } else if opts.nonInteractive {
+    if opts.keepVFR {
       cfrFPS = nil
+    } else if let v = opts.cfrFPS {
+      cfrFPS = v
     } else {
-      let idx = selectOption(
-        title: "Post-process to CFR 60fps?",
-        options: ["No", "Yes"],
-        defaultIndex: 0
-      )
-      cfrFPS = (idx == 1) ? 60 : nil
+      // Default to CFR 60; users can opt out with --vfr.
+      cfrFPS = 60
     }
 
     let logicalWidth = Int(display.width)
@@ -219,6 +215,11 @@ struct ScreencapWizard {
       print("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh")
     } else {
       print("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ \(opts.fps) fps")
+    }
+    if opts.keepVFR {
+      print("  Timing: VFR")
+    } else {
+      print("  Timing: CFR \(cfrFPS ?? 60) fps")
     }
     if includeMic, let audioDevice {
       print("  Microphone: \(audioDevice.localizedName)")
