@@ -9,9 +9,15 @@ let package = Package(
   products: [
     .executable(name: "capa", targets: ["capa"])
   ],
+  dependencies: [
+    .package(url: "https://github.com/apple/swift-argument-parser", from: "1.4.0")
+  ],
   targets: [
     .executableTarget(
       name: "capa",
+      dependencies: [
+        .product(name: "ArgumentParser", package: "swift-argument-parser")
+      ],
       path: "Sources"
     )
   ]

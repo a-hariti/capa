@@ -1,32 +1,85 @@
+import ArgumentParser
 import AVFoundation
 import Foundation
 @preconcurrency import ScreenCaptureKit
 import Darwin
 
 @main
-struct ScreencapWizard {
-  static func main() async {
-    let argv = CommandLine.arguments
-    let exe = (argv.first as NSString?)?.lastPathComponent ?? "capa"
+struct Capa: AsyncParsableCommand {
+  static let configuration = CommandConfiguration(
+    abstract: "Native macOS screen recorder (QuickTime-like output)."
+  )
 
-    let opts: CLIOptions
-    do {
-      opts = try CLIOptions.parse(argv)
-    } catch {
-      print("Error: \(error)")
-      print("")
-      print(CLIOptions.usage(exe: exe))
-      return
+  @Flag(name: [.customLong("list-displays")], help: "List available displays and exit")
+  var listDisplays = false
+
+  @Flag(name: [.customLong("list-mics"), .customLong("list-microphones")], help: "List available microphones and exit")
+  var listMicrophones = false
+
+  @Option(name: .customLong("display-index"), help: "Select display by index (from --list-displays)")
+  var displayIndex: Int?
+
+  @Flag(name: .customLong("no-mic"), help: "Disable microphone")
+  var noMicrophone = false
+
+  @Option(name: .customLong("mic-index"), help: "Select microphone by index (from --list-mics)")
+  var microphoneIndex: Int?
+
+  @Option(name: .customLong("mic-id"), help: "Select microphone by AVCaptureDevice.uniqueID")
+  var microphoneID: String?
+
+  @Flag(name: .customLong("system-audio"), help: "Capture system audio to a separate track")
+  var systemAudioFlag = false
+
+  @Flag(name: .customLong("vfr"), help: "Keep variable frame rate (skip CFR post-process)")
+  var keepVFR = false
+
+  @Option(name: .customLong("fps"), help: "Post-process to constant frame rate (default: 60 fps)")
+  var fps: Int?
+
+  @Option(name: .customLong("codec"), help: "Video codec (h264|hevc)")
+  var codecString: String?
+
+  @Option(name: .customLong("duration"), help: "Auto-stop after N seconds (non-interactive friendly)")
+  var durationSeconds: Int?
+
+  @Option(name: [.customLong("out"), .customLong("output")], help: "Output file path (default: recs/screen-<ts>.mov)")
+  var outputPath: String?
+
+  @Flag(name: .customLong("open"), help: "Open file when done")
+  var openFlag = false
+
+  @Flag(name: .customLong("no-open"), help: "Do not open file when done")
+  var noOpenFlag = false
+
+  @Flag(name: .customLong("non-interactive"), help: "Error instead of prompting for missing options")
+  var nonInteractive = false
+
+  mutating func validate() throws {
+    if let displayIndex, displayIndex < 0 {
+      throw ValidationError("--display-index must be >= 0")
     }
-
-    if opts.help {
-      print(CLIOptions.usage(exe: exe))
-      return
+    if let microphoneIndex, microphoneIndex < 0 {
+      throw ValidationError("--mic-index must be >= 0")
     }
+    if openFlag && noOpenFlag {
+      throw ValidationError("Cannot use --open and --no-open together.")
+    }
+    if let durationSeconds, durationSeconds < 1 {
+      throw ValidationError("--duration must be >= 1")
+    }
+    if let codecString, parseCodec(codecString) == nil {
+      throw ValidationError("Invalid --codec: \(codecString) (expected: h264|hevc)")
+    }
+    if let fps, fps < 1 {
+      throw ValidationError("--fps must be >= 1")
+    }
+  }
 
+  mutating func run() async throws {
     print("capa (Native macOS Screen Capture)")
 
-    if opts.listMicrophones {
+    if listMicrophones {
       let audioDevices = AVCaptureDevice.DiscoverySession(
         deviceTypes: [.microphone, .external],
         mediaType: .audio,
@@ -49,20 +102,14 @@ struct ScreencapWizard {
       return
     }
 
-    let content: SCShareableContent
-    do {
-      content = try await SCShareableContent.current
-    } catch {
-      print("Failed to load shareable content: \(error)")
-      return
-    }
+    let content = try await SCShareableContent.current
 
     guard !content.displays.isEmpty else {
       print("No displays found.")
       return
     }
 
-    if opts.listDisplays {
+    if listDisplays {
       for (i, d) in content.displays.enumerated() {
         print("[\(i)] \(displayLabel(d))")
       }
@@ -70,13 +117,13 @@ struct ScreencapWizard {
     }
 
     let display: SCDisplay
-    if let idx = opts.displayIndex {
+    if let idx = displayIndex {
       guard idx >= 0 && idx < content.displays.count else {
         print("Error: --display-index out of range (0...\(content.displays.count - 1))")
         return
       }
       display = content.displays[idx]
-    } else if opts.nonInteractive {
+    } else if nonInteractive {
       print("Error: missing display selection; use --display-index (or omit --non-interactive).")
       return
     } else {
@@ -93,9 +140,9 @@ struct ScreencapWizard {
     ).devices
 
     let includeSystemAudio: Bool
-    if opts.includeSystemAudio {
+    if systemAudioFlag {
       includeSystemAudio = true
-    } else if opts.nonInteractive {
+    } else if nonInteractive {
       includeSystemAudio = false
     } else {
       let idx = selectOption(
@@ -108,23 +155,23 @@ struct ScreencapWizard {
 
     var audioDevice: AVCaptureDevice?
     var includeMic = false
-    if opts.noMicrophone {
+    if noMicrophone {
       includeMic = false
-    } else if let idx = opts.microphoneIndex {
+    } else if let idx = microphoneIndex {
       guard idx >= 0 && idx < audioDevices.count else {
         print("Error: --mic-index out of range (0...\(max(0, audioDevices.count - 1)))")
         return
       }
       audioDevice = audioDevices[idx]
       includeMic = true
-    } else if let id = opts.microphoneID {
+    } else if let id = microphoneID {
       guard let d = audioDevices.first(where: { $0.uniqueID == id }) else {
         print("Error: no microphone with id \(id)")
         return
       }
       audioDevice = d
       includeMic = true
-    } else if opts.nonInteractive {
+    } else if nonInteractive {
       includeMic = false
     } else if !audioDevices.isEmpty {
       let audioOptions = ["No microphone"] + audioDevices.map(microphoneLabel)
@@ -146,9 +193,9 @@ struct ScreencapWizard {
     }
 
     let codec: AVVideoCodecType
-    if let c = opts.codec {
+    if let c = codecString.flatMap(parseCodec) {
       codec = c
-    } else if opts.nonInteractive {
+    } else if nonInteractive {
       codec = .h264
     } else {
       let codecOptions = ["H.264", "H.265/HEVC"]
@@ -158,10 +205,13 @@ struct ScreencapWizard {
     }
 
     let cfrFPS: Int?
-    if opts.keepVFR {
+    if keepVFR {
+      if fps != nil {
+        print("Warning: --vfr overrides --fps; CFR post-processing is disabled.")
+      }
       cfrFPS = nil
-    } else if let v = opts.cfrFPS {
-      cfrFPS = v
+    } else if let v = fps {
+      cfrFPS = max(1, min(240, v))
     } else {
       // Default to CFR 60; users can opt out with --vfr.
       cfrFPS = 60
@@ -181,7 +231,7 @@ struct ScreencapWizard {
     try? FileManager.default.createDirectory(at: recsDir, withIntermediateDirectories: true)
 
     let outFile: URL
-    if let outputPath = opts.outputPath {
+    if let outputPath = outputPath {
       let u = URL(fileURLWithPath: outputPath)
       if u.pathExtension.isEmpty {
         try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true)
@@ -207,7 +257,7 @@ struct ScreencapWizard {
     let codecName = (codec == .hevc) ? "H.265/HEVC" : "H.264"
     print("Settings:")
     print("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh")
-    if opts.keepVFR {
+    if keepVFR {
       print("  Timing: VFR")
     } else {
       print("  Timing: CFR \(cfrFPS ?? 60) fps")
@@ -249,7 +299,7 @@ struct ScreencapWizard {
     sigintSource.setEventHandler { stopSignal.signal() }
     sigintSource.resume()
 
-    let duration = opts.durationSeconds
+    let duration = durationSeconds
       ?? (ProcessInfo.processInfo.environment["SCREENCAP_AUTOSTOP_SECONDS"].flatMap { Int($0) })
     if let seconds = duration, seconds > 0 {
       print("Auto-stop: \(seconds)s")
@@ -311,9 +361,11 @@ struct ScreencapWizard {
     }
     print("")
     let shouldOpen: Bool
-    if let openWhenDone = opts.openWhenDone {
-      shouldOpen = openWhenDone
-    } else if opts.nonInteractive {
+    if openFlag {
+      shouldOpen = true
+    } else if noOpenFlag {
+      shouldOpen = false
+    } else if nonInteractive {
       shouldOpen = false
     } else {
       shouldOpen = promptYesNo("Open file now?", defaultYes: true)
@@ -325,5 +377,16 @@ struct ScreencapWizard {
       p.arguments = [outFile.path]
       try? p.run()
     }
+  }
+}
+
+private func parseCodec(_ s: String) -> AVVideoCodecType? {
+  switch s.lowercased() {
+  case "h264", "avc", "avc1":
+    return .h264
+  case "hevc", "h265", "hvc", "hvc1":
+    return .hevc
+  default:
+    return nil
   }
 }
