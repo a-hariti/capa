@@ -26,16 +26,27 @@ struct ScreencapWizard {
 
     print("capa (Native macOS Screen Capture)")
 
+    if opts.listMicrophones {
+      let audioDevices = AVCaptureDevice.DiscoverySession(
+        deviceTypes: [.microphone, .external],
+        mediaType: .audio,
+        position: .unspecified
+      ).devices
+
+      if audioDevices.isEmpty {
+        print("(no microphones)")
+      } else {
+        for (i, d) in audioDevices.enumerated() {
+          print("[\(i)] \(microphoneLabel(d)) id=\(d.uniqueID)")
+        }
+      }
+      return
+    }
+
     if !requestScreenRecordingAccess() {
       print("Screen recording permission not granted.")
       print("System Settings -> Privacy & Security -> Screen Recording -> allow this binary.")
       return
-    }
-
-    let micGranted = await requestMicrophoneAccess()
-    if !micGranted {
-      print("Microphone permission not granted. Continuing without microphone.")
-      print("System Settings -> Privacy & Security -> Microphone -> allow this binary.")
     }
 
     let content: SCShareableContent
@@ -89,16 +100,7 @@ struct ScreencapWizard {
 
     var audioDevice: AVCaptureDevice?
     var includeMic = false
-    if opts.listMicrophones {
-      if audioDevices.isEmpty {
-        print("(no microphones)")
-      } else {
-        for (i, d) in audioDevices.enumerated() {
-          print("[\(i)] \(microphoneLabel(d)) id=\(d.uniqueID)")
-        }
-      }
-      return
-    } else if opts.noMicrophone || !micGranted {
+    if opts.noMicrophone {
       includeMic = false
     } else if let idx = opts.microphoneIndex {
       guard idx >= 0 && idx < audioDevices.count else {
@@ -123,6 +125,23 @@ struct ScreencapWizard {
         audioDevice = audioDevices[audioIdx - 1]
         includeMic = true
       }
+    }
+
+    if includeMic {
+      let micGranted = await requestMicrophoneAccess()
+      if !micGranted {
+        print("Microphone permission not granted. Continuing without microphone.")
+        print("System Settings -> Privacy & Security -> Microphone -> allow this binary.")
+        includeMic = false
+        audioDevice = nil
+      }
+    }
+
+    let includeSystemAudio: Bool
+    if opts.nonInteractive {
+      includeSystemAudio = opts.includeSystemAudio
+    } else {
+      includeSystemAudio = promptYesNo("Capture system audio to a separate track?", defaultYes: false)
     }
 
     let codec: AVVideoCodecType
@@ -168,6 +187,7 @@ struct ScreencapWizard {
       videoCodec: codec,
       includeMicrophone: includeMic,
       microphoneDeviceID: includeMic ? audioDevice?.uniqueID : nil,
+      includeSystemAudio: includeSystemAudio,
       width: geometry.pixelWidth,
       height: geometry.pixelHeight,
       fps: opts.fps
@@ -186,6 +206,7 @@ struct ScreencapWizard {
     } else {
       print("  Microphone: none")
     }
+    print("  System audio: \(includeSystemAudio ? "on" : "off")")
     print("Output file: \(outFile.path)")
     let canReadKeys = Terminal.isTTY(STDIN_FILENO)
     if canReadKeys {

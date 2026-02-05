@@ -15,6 +15,9 @@ struct CLIOptions: Sendable {
   var microphoneIndex: Int?
   var microphoneID: String?
 
+  /// Capture system audio to a separate track.
+  var includeSystemAudio = false
+
   var codec: AVVideoCodecType?
   /// `0` means "native refresh rate" (passes `kCMTimeZero` to ScreenCaptureKit).
   var fps: Int = 60
@@ -104,6 +107,12 @@ struct CLIOptions: Sendable {
 
       if a == "--no-mic" || a == "--no-microphone" {
         out.noMicrophone = true
+        i += 1
+        continue
+      }
+
+      if a == "--system-audio" {
+        out.includeSystemAudio = true
         i += 1
         continue
       }
@@ -223,6 +232,7 @@ struct CLIOptions: Sendable {
       --no-mic                        Disable microphone
       --mic-index N                   Select microphone by index (from --list-mics)
       --mic-id ID                     Select microphone by AVCaptureDevice.uniqueID
+      --system-audio                  Capture system audio to a separate track
       --codec h264|hevc               Video codec (default: prompt / h264)
       --fps N                         Capture update rate hint (0=native refresh, default: 60)
       --duration SECONDS              Auto-stop after N seconds (non-interactive friendly)
