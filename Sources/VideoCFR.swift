@@ -314,6 +314,8 @@ enum VideoCFR {
     // End time: use the asset duration relative to 0; session is anchored at minPTS.
     let duration = try await asset.load(.duration)
     let endPTS = minPTS + duration
+    let durationSeconds = max(0.0, duration.seconds)
+    let totalFramesEstimate = Int64(max(1.0, ceil(durationSeconds * Double(fps))))
 
     let state = State(
       writer: writer,
@@ -328,6 +330,9 @@ enum VideoCFR {
       audio: audioPipes,
       firstAudio: firstAudioSamples
     )
+
+    let progress = ProgressBar(prefix: "Transcoding", total: totalFramesEstimate)
+    progress.startIfTTY()
 
     try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
       final class AwaitState: @unchecked Sendable {
@@ -364,6 +369,7 @@ enum VideoCFR {
 
       state.videoIn.requestMediaDataWhenReady(on: q) {
         state.stepVideo()
+        progress.update(completed: state.frameIndex)
         if let err = state.failure { finish(err); return }
         if state.videoDone, !state.videoSignaled {
           state.videoSignaled = true
@@ -387,8 +393,56 @@ enum VideoCFR {
       writer.finishWriting { cont.resume(returning: ()) }
     }
 
+    progress.stop()
+
     if writer.status == .failed {
       throw writer.error ?? NSError(domain: "VideoCFR", code: 24, userInfo: [NSLocalizedDescriptionKey: "Writer failed"])
+    }
+  }
+}
+
+final class ProgressBar: @unchecked Sendable {
+  private let fd: UnsafeMutablePointer<FILE> = stderr
+  private let prefix: String
+  private let total: Int64
+  private var lastLen = 0
+  private var active = false
+
+  init(prefix: String, total: Int64) {
+    self.prefix = prefix
+    self.total = max(1, total)
+  }
+
+  func startIfTTY() {
+    guard isatty(fileno(fd)) != 0 else { return }
+    active = true
+    write("\u{001B}[?25l") // hide cursor
+  }
+
+  func update(completed: Int64) {
+    guard active else { return }
+    let clamped = max(0, min(total, completed))
+    let pct = Int((Double(clamped) / Double(total)) * 100.0)
+    let width = 24
+    let filled = Int((Double(width) * Double(clamped)) / Double(total))
+    let bar = String(repeating: "#", count: filled) + String(repeating: ".", count: max(0, width - filled))
+    let s = "\(prefix) [\(bar)] \(pct)%"
+    let pad = max(0, lastLen - s.utf8.count)
+    lastLen = s.utf8.count
+    write("\r" + s + String(repeating: " ", count: pad))
+  }
+
+  func stop() {
+    guard active else { return }
+    active = false
+    write("\r" + String(repeating: " ", count: max(0, lastLen)) + "\r")
+    write("\u{001B}[?25h\n") // show cursor + newline
+  }
+
+  private func write(_ s: String) {
+    s.withCString { cstr in
+      fputs(cstr, fd)
+      fflush(fd)
     }
   }
 }
