@@ -200,7 +200,7 @@ final class ElapsedTicker {
     guard let startTime else { return }
     let elapsed = max(0, Int((DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000))
     let timerText = TUITheme.title(format(elapsedSeconds: elapsed))
-    var s = "\(TUITheme.accent(prefix, bold: true)) \(timerText)"
+    var s = "\(TUITheme.recordingDot(prefix)) \(timerText)"
     if let suffix {
       let extra = suffix()
       if !extra.isEmpty {

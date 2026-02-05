@@ -9,13 +9,21 @@ func displayLabel(_ display: SCDisplay) -> String {
   let displayID = CGDirectDisplayID(display.displayID)
 
   var extra: [String] = []
+  var pixelW = 0
+  var pixelH = 0
   if let mode = CGDisplayCopyDisplayMode(displayID) {
-    if mode.pixelWidth > 0 && mode.pixelHeight > 0 {
-      extra.append("\(mode.pixelWidth)x\(mode.pixelHeight)px")
-    }
+    pixelW = mode.pixelWidth
+    pixelH = mode.pixelHeight
     if mode.refreshRate > 0 {
       extra.append(String(format: "%.0fHz", mode.refreshRate))
     }
+  }
+  if pixelW <= 0 || pixelH <= 0 {
+    pixelW = Int(CGDisplayPixelsWide(displayID))
+    pixelH = Int(CGDisplayPixelsHigh(displayID))
+  }
+  if pixelW > 0 && pixelH > 0 {
+    extra.insert("\(pixelW)x\(pixelH)px", at: 0)
   }
 
   let base = "Display \(display.displayID) - \(logicalW)x\(logicalH)pt"

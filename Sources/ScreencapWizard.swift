@@ -67,6 +67,9 @@ struct Capa: AsyncParsableCommand {
   @Flag(name: .customLong("non-interactive"), help: "Error instead of prompting for missing options")
   var nonInteractive = false
 
+  @Flag(name: [.short, .customLong("verbose")], help: "Show detailed capture settings/debug output")
+  var verbose = false
+
   mutating func validate() throws {
     if let displayIndex, displayIndex < 0 {
       throw ValidationError("--display-index must be >= 0")
@@ -299,7 +302,6 @@ struct Capa: AsyncParsableCommand {
     let logicalHeight = Int(display.height)
     let geometry = captureGeometry(filter: filter, fallbackLogicalSize: (logicalWidth, logicalHeight))
     let scaleStr = String(format: "%.2f", geometry.pointPixelScale)
-    print("Capture: \(Int(geometry.sourceRect.width))x\(Int(geometry.sourceRect.height)) pt @ \(scaleStr)x => \(geometry.pixelWidth)x\(geometry.pixelHeight) px")
 
     let formatter = DateFormatter()
     formatter.dateFormat = "yyyyMMdd-HHmmss"
@@ -356,30 +358,33 @@ struct Capa: AsyncParsableCommand {
     let recorder = ScreenRecorder(filter: filter, options: recorderOptions)
 
     let codecName = (codec == .hevc) ? "H.265/HEVC" : "H.264"
-    print("Settings:")
-    print("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh")
-    if keepVFR {
-      print("  Screen timing: VFR")
-    } else {
-      print("  Screen timing: CFR \(cfrFPS ?? 60) fps")
-    }
-    if includeCamera {
-      print("  Camera timing: native (no CFR)")
-    }
-    if includeMic, let audioDevice {
-      print("  Microphone: \(audioDevice.localizedName)")
-    } else {
-      print("  Microphone: none")
-    }
-    if includeCamera, let cameraDevice {
-      print("  Camera: \(cameraDevice.localizedName)")
-    } else {
-      print("  Camera: none")
-    }
-    print("  System audio: \(includeSystemAudio ? "on" : "off")")
-    print("Output (screen): \(outFile.path)")
-    if let cameraOutFile {
-      print("Output (camera): \(cameraOutFile.path)")
+    if verbose {
+      print("Capture: \(Int(geometry.sourceRect.width))x\(Int(geometry.sourceRect.height)) pt @ \(scaleStr)x => \(geometry.pixelWidth)x\(geometry.pixelHeight) px")
+      print("Settings:")
+      print("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh")
+      if keepVFR {
+        print("  Screen timing: VFR")
+      } else {
+        print("  Screen timing: CFR \(cfrFPS ?? 60) fps")
+      }
+      if includeCamera {
+        print("  Camera timing: native (no CFR)")
+      }
+      if includeMic, let audioDevice {
+        print("  Microphone: \(audioDevice.localizedName)")
+      } else {
+        print("  Microphone: none")
+      }
+      if includeCamera, let cameraDevice {
+        print("  Camera: \(cameraDevice.localizedName)")
+      } else {
+        print("  Camera: none")
+      }
+      print("  System audio: \(includeSystemAudio ? "on" : "off")")
+      print("Output (screen): \(outFile.path)")
+      if let cameraOutFile {
+        print("Output (camera): \(cameraOutFile.path)")
+      }
     }
     let canReadKeys = Terminal.isTTY(STDIN_FILENO)
     if canReadKeys {
@@ -482,7 +487,7 @@ struct Capa: AsyncParsableCommand {
       }
     }
 
-    if includeSystemAudio || includeMic {
+    if verbose, includeSystemAudio || includeMic {
       let screenHasMaster = (includeSystemAudio || includeMic) && (includeCamera || (includeSystemAudio && includeMic))
       var parts: [String] = []
       if screenHasMaster { parts.append("qaa=Master (mixed)") }
@@ -490,7 +495,7 @@ struct Capa: AsyncParsableCommand {
       if includeSystemAudio { parts.append("qab=System") }
       print("Audio tracks (language tags): " + parts.joined(separator: ", "))
     }
-    if includeCamera, cameraOutFile != nil {
+    if verbose, includeCamera, cameraOutFile != nil {
       print("Video files: screen=\(outFile.lastPathComponent), camera=\(cameraOutFile!.lastPathComponent)")
       print("Camera file audio: a0=Mic (if enabled), a1=Master (mixed, for alignment)")
     }

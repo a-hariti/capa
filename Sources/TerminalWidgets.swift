@@ -50,6 +50,7 @@ enum TUITheme {
     static let meterMid = 226
     static let meterHot = 196
     static let meterIdle = 245
+    static let recordingDot = 196
   }
 
   enum Glyph {
@@ -76,6 +77,10 @@ enum TUITheme {
   static func accent(_ s: String, bold: Bool = false) -> String {
     let b = bold ? Ansi.bold : ""
     return "\(b)\(Ansi.fg256(Color.accent))\(s)\(Ansi.reset)"
+  }
+
+  static func recordingDot(_ s: String) -> String {
+    "\(Ansi.bold)\(Ansi.fg256(Color.recordingDot))\(s)\(Ansi.reset)"
   }
 }
 
