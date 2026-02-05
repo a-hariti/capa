@@ -457,10 +457,15 @@ struct Capa: AsyncParsableCommand {
 
     if includeSystemAudio || includeMic {
       var parts: [String] = []
-      if includeSystemAudio { parts.append("qab=System") }
+      if includeSystemAudio && includeMic {
+        parts.append("qaa=Master (mixed)")
+      }
       if includeMic { parts.append("qac=Mic") }
-      parts.append("qaa=Master (mixed)")
+      if includeSystemAudio { parts.append("qab=System") }
       print("Audio tracks (language tags): " + parts.joined(separator: ", "))
+    }
+    if includeCamera {
+      print("Video tracks: v0=Screen, v1=Camera")
     }
     print("")
     let shouldOpen: Bool
