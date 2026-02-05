@@ -122,6 +122,7 @@ final class ElapsedTicker {
   private var timer: DispatchSourceTimer?
   private var startTime: DispatchTime?
   private var lastPrintedLen: Int = 0
+  private var cursorHidden = false
 
   init(prefix: String = "🔴", toStderr: Bool = true) {
     self.prefix = prefix
@@ -138,6 +139,7 @@ final class ElapsedTicker {
   func start() {
     guard timer == nil else { return }
     startTime = .now()
+    hideCursor()
 
     let t = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
     t.schedule(deadline: .now(), repeating: .seconds(1), leeway: .milliseconds(50))
@@ -150,6 +152,7 @@ final class ElapsedTicker {
     guard let t = timer else { return }
     timer = nil
     t.cancel()
+    showCursor()
     writeLine("\n")
   }
 
@@ -177,5 +180,19 @@ final class ElapsedTicker {
       fputs(cstr, fd)
       fflush(fd)
     }
+  }
+
+  private func hideCursor() {
+    guard !cursorHidden else { return }
+    cursorHidden = true
+    // ANSI: hide cursor
+    writeLine("\u{001B}[?25l")
+  }
+
+  private func showCursor() {
+    guard cursorHidden else { return }
+    cursorHidden = false
+    // ANSI: show cursor
+    writeLine("\u{001B}[?25h")
   }
 }
