@@ -81,7 +81,7 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
   }
 
   func render() {
-    print(TUITheme.title("\(title):"))
+    print(TUITheme.primary("\(title):"))
     for i in 0..<options.count {
       let parts = splitPrimarySecondary(options[i])
       let secondary = parts.secondary.map { " " + TUITheme.muted($0) } ?? ""
@@ -116,7 +116,7 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
       }
       print("\u{001B}[\(lines - 1)A", terminator: "")
       let picked = splitPrimarySecondary(options[index]).primary
-      print("\(TUITheme.title("\(title):")) \(TUITheme.option(picked))")
+      print("\(TUITheme.primary("\(title):")) \(TUITheme.option(picked))")
       return index
     default:
       break

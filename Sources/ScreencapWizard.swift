@@ -95,10 +95,23 @@ struct Capa: AsyncParsableCommand {
   }
 
   mutating func run() async throws {
-    print("capa (Native macOS Screen Capture)")
     let isTTYOut = Terminal.isTTY(STDOUT_FILENO)
+    let banner = isTTYOut
+      ? "Capa \(TUITheme.label("(native macOS screen capture)"))"
+      : "Capa (native macOS screen capture)"
+    print(banner)
+    print("")
     func sectionTitle(_ s: String) -> String { isTTYOut ? TUITheme.title(s) : s }
     func muted(_ s: String) -> String { isTTYOut ? TUITheme.muted(s) : s }
+    func optionText(_ s: String) -> String { isTTYOut ? TUITheme.option(s) : s }
+    func abbreviateHomePath(_ p: String) -> String {
+      let home = NSHomeDirectory()
+      if p == home { return "~" }
+      if p.hasPrefix(home + "/") {
+        return "~" + String(p.dropFirst(home.count))
+      }
+      return p
+    }
 
     if listMicrophones {
       let audioDevices = AVCaptureDevice.DiscoverySession(
@@ -154,6 +167,7 @@ struct Capa: AsyncParsableCommand {
       return
     }
 
+    let autoSelectedSingleDisplay = (displayIndex == nil && content.displays.count == 1)
     let display: SCDisplay
     if let idx = displayIndex {
       guard idx >= 0 && idx < content.displays.count else {
@@ -161,6 +175,8 @@ struct Capa: AsyncParsableCommand {
         return
       }
       display = content.displays[idx]
+    } else if content.displays.count == 1 {
+      display = content.displays[0]
     } else if nonInteractive {
       print("Error: missing display selection; use --display-index (or omit --non-interactive).")
       return
@@ -170,6 +186,14 @@ struct Capa: AsyncParsableCommand {
       display = content.displays[displayIdx]
     }
     let filter = SCContentFilter(display: display, excludingWindows: [])
+    let logicalWidth = Int(display.width)
+    let logicalHeight = Int(display.height)
+    let geometry = captureGeometry(filter: filter, fallbackLogicalSize: (logicalWidth, logicalHeight))
+
+    if autoSelectedSingleDisplay && !nonInteractive {
+      let displayLabel = isTTYOut ? TUITheme.primary("Display:") : "Display:"
+      print("\(displayLabel) \(optionText("\(geometry.pixelWidth)x\(geometry.pixelHeight)px"))")
+    }
 
     let audioDevices = AVCaptureDevice.DiscoverySession(
       deviceTypes: [.microphone, .external],
@@ -301,9 +325,6 @@ struct Capa: AsyncParsableCommand {
       cfrFPS = 60
     }
 
-    let logicalWidth = Int(display.width)
-    let logicalHeight = Int(display.height)
-    let geometry = captureGeometry(filter: filter, fallbackLogicalSize: (logicalWidth, logicalHeight))
     let scaleStr = String(format: "%.2f", geometry.pointPixelScale)
 
     let formatter = DateFormatter()
@@ -388,6 +409,9 @@ struct Capa: AsyncParsableCommand {
       print("")
     }
     let canReadKeys = Terminal.isTTY(STDIN_FILENO)
+    if !verbose {
+      print("")
+    }
     if canReadKeys {
       print("Recording... press 'q' to stop.")
     } else {
@@ -480,6 +504,7 @@ struct Capa: AsyncParsableCommand {
     }
 
     if let cfrFPS {
+      print("")
       print("Post-processing screen video to \(cfrFPS) fps...")
       do {
         try await VideoCFR.rewriteInPlace(url: outFile, fps: cfrFPS)
@@ -489,10 +514,10 @@ struct Capa: AsyncParsableCommand {
     }
 
     print("")
-    print(sectionTitle("Outputs:"))
-    print("  Screen: \(outFile.path)")
+    print(sectionTitle("Files:"))
+    print("\(isTTYOut ? TUITheme.label("  Screen:") : "  Screen:") \(abbreviateHomePath(outFile.path))")
     if let cameraOutFile {
-      print("  Camera: \(cameraOutFile.path)")
+      print("\(isTTYOut ? TUITheme.label("  Camera:") : "  Camera:") \(abbreviateHomePath(cameraOutFile.path))")
     }
 
     if verbose, includeSystemAudio || includeMic {
@@ -515,6 +540,9 @@ struct Capa: AsyncParsableCommand {
       shouldOpen = false
     } else if nonInteractive {
       shouldOpen = false
+    } else if Terminal.isTTY(STDIN_FILENO) {
+      let prompt = includeCamera ? "Open screen capture?" : "Open file now?"
+      shouldOpen = (selectOption(title: prompt, options: ["Yes", "No"], defaultIndex: 0) == 0)
     } else {
       shouldOpen = promptYesNo("Open file now?", defaultYes: true)
     }
