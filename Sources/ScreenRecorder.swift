@@ -25,6 +25,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
 
     var width: Int
     var height: Int
+    var showsCursor: Bool = true
 
     /// Optional secondary video source (camera) written to its own `.mov`.
     var includeCamera: Bool = false
@@ -33,6 +34,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
 
     /// Called on the recorder's IO queue with a best-effort dBFS estimate.
     var onAudioLevel: (@Sendable (AudioSource, Float) -> Void)?
+
+    /// Shared metadata used to identify files that should align in post.
+    var timecodeSync: TimecodeSyncContext?
   }
 
   private struct UnsafeSample: @unchecked Sendable {
@@ -61,11 +65,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
   private var videoAdaptor: AVAssetWriterInputPixelBufferAdaptor?
   private var micAudioIn: AVAssetWriterInput?
   private var systemAudioIn: AVAssetWriterInput?
+  private var timecodeIn: AVAssetWriterInput?
 
   private var cameraWriter: AVAssetWriter?
   private var cameraVideoIn: AVAssetWriterInput?
   private var cameraAdaptor: AVAssetWriterInputPixelBufferAdaptor?
   private var cameraMicAudioIn: AVAssetWriterInput?
+  private var cameraTimecodeIn: AVAssetWriterInput?
 
   // We must not drop audio samples just because the writer input has backpressure.
   // Dropping can produce perceptual artifacts (metallic/echoey audio). Buffer and drain instead.
@@ -168,6 +174,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     cfg.pixelFormat = kCVPixelFormatType_32BGRA
     cfg.colorSpaceName = CGColorSpace.sRGB
 
+    cfg.showsCursor = options.showsCursor
+
     cfg.capturesAudio = options.includeSystemAudio
     cfg.captureMicrophone = options.includeMicrophone
     cfg.microphoneCaptureDeviceID = options.microphoneDeviceID
@@ -187,10 +195,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     self.videoAdaptor = nil
     self.micAudioIn = nil
     self.systemAudioIn = nil
+    self.timecodeIn = nil
     self.cameraWriter = nil
     self.cameraVideoIn = nil
     self.cameraAdaptor = nil
     self.cameraMicAudioIn = nil
+    self.cameraTimecodeIn = nil
     self.micQueue = []
     self.micQueueReadIndex = 0
     self.cameraMicQueue = []
@@ -557,6 +567,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     }
 
     let writer = try AVAssetWriter(outputURL: options.outputURL, fileType: .mov)
+    if let sync = options.timecodeSync {
+      writer.metadata = sync.metadata(role: "screen")
+    }
 
     // Base on Apple's recommended presets, then remove bitrate caps so the encoder can "breathe"
     // on high-frequency UI edges (where washed-out chroma is most noticeable).
@@ -614,6 +627,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
 
     var micAudioIn: AVAssetWriterInput?
     var systemAudioIn: AVAssetWriterInput?
+    var timecodeIn: AVAssetWriterInput?
     let audioSettings = assistant.audioSettings ?? [
       AVFormatIDKey: kAudioFormatMPEG4AAC,
       AVNumberOfChannelsKey: 2,
@@ -625,6 +639,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     var cameraVideoIn: AVAssetWriterInput?
     var cameraAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     var cameraMicAudioIn: AVAssetWriterInput?
+    var cameraTimecodeIn: AVAssetWriterInput?
     if options.includeCamera {
       guard let cameraOutputURL = options.cameraOutputURL else {
         throw NSError(domain: "ScreenRecorder", code: 35, userInfo: [NSLocalizedDescriptionKey: "Camera enabled but cameraOutputURL was not provided"])
@@ -641,6 +656,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
       let camH = CVPixelBufferGetHeight(cameraPB)
 
       let cw = try AVAssetWriter(outputURL: cameraOutputURL, fileType: .mov)
+      if let sync = options.timecodeSync {
+        cw.metadata = sync.metadata(role: "camera")
+      }
 
       guard let assistant2 = AVOutputSettingsAssistant(preset: preset) else {
         throw NSError(domain: "ScreenRecorder", code: 37, userInfo: [NSLocalizedDescriptionKey: "AVOutputSettingsAssistant unavailable for camera preset \(preset)"])
@@ -693,6 +711,16 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
         }
       }
 
+      if let sync = options.timecodeSync {
+        let tcIn = sync.makeTimecodeWriterInput()
+        guard cw.canAdd(tcIn) else {
+          throw NSError(domain: "ScreenRecorder", code: 44, userInfo: [NSLocalizedDescriptionKey: "Cannot add camera timecode input"])
+        }
+        cw.add(tcIn)
+        camIn.addTrackAssociation(withTrackOf: tcIn, type: AVAssetTrack.AssociationType.timecode.rawValue)
+        cameraTimecodeIn = tcIn
+      }
+
       guard cw.startWriting() else {
         throw cw.error ?? NSError(domain: "ScreenRecorder", code: 42, userInfo: [NSLocalizedDescriptionKey: "Failed to start camera writer"])
       }
@@ -729,6 +757,16 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
       }
     }
 
+    if let sync = options.timecodeSync {
+      let tcIn = sync.makeTimecodeWriterInput()
+      guard writer.canAdd(tcIn) else {
+        throw NSError(domain: "ScreenRecorder", code: 45, userInfo: [NSLocalizedDescriptionKey: "Cannot add timecode input"])
+      }
+      writer.add(tcIn)
+      videoIn.addTrackAssociation(withTrackOf: tcIn, type: AVAssetTrack.AssociationType.timecode.rawValue)
+      timecodeIn = tcIn
+    }
+
     guard writer.startWriting() else {
       throw writer.error ?? NSError(domain: "ScreenRecorder", code: 34, userInfo: [NSLocalizedDescriptionKey: "Failed to start writing"])
     }
@@ -739,10 +777,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     self.videoAdaptor = adaptor
     self.micAudioIn = micAudioIn
     self.systemAudioIn = systemAudioIn
+    self.timecodeIn = timecodeIn
     self.cameraWriter = cameraWriter
     self.cameraVideoIn = cameraVideoIn
     self.cameraAdaptor = cameraAdaptor
     self.cameraMicAudioIn = cameraMicAudioIn
+    self.cameraTimecodeIn = cameraTimecodeIn
     self.sessionStartPTS = startPTS
 
     // Flush any audio samples that arrived before video started.
@@ -757,6 +797,18 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
       throw NSError(domain: "ScreenRecorder", code: 40, userInfo: [NSLocalizedDescriptionKey: "No frames captured (writer never started)"])
     }
 
+    if
+      let sync = options.timecodeSync,
+      let sessionStartPTS,
+      let timecodeIn,
+      writer.status == .writing
+    {
+      let duration = positiveDuration(start: sessionStartPTS, end: lastPTS, fps: sync.fps)
+      let sbuf = try sync.makeTimecodeSampleBuffer(presentationTimeStamp: sessionStartPTS, duration: duration)
+      if !timecodeIn.append(sbuf) {
+        throw writer.error ?? NSError(domain: "ScreenRecorder", code: 46, userInfo: [NSLocalizedDescriptionKey: "Failed to append timecode sample"])
+      }
+    }
     if writer.status == .writing {
       writer.endSession(atSourceTime: lastPTS)
     }
@@ -764,12 +816,27 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     videoIn?.markAsFinished()
     micAudioIn?.markAsFinished()
     systemAudioIn?.markAsFinished()
+    timecodeIn?.markAsFinished()
 
+    if
+      let sync = options.timecodeSync,
+      let sessionStartPTS,
+      let cameraWriter,
+      cameraWriter.status == .writing,
+      let cameraTimecodeIn
+    {
+      let duration = positiveDuration(start: sessionStartPTS, end: cameraLastPTS, fps: sync.fps)
+      let sbuf = try sync.makeTimecodeSampleBuffer(presentationTimeStamp: sessionStartPTS, duration: duration)
+      if !cameraTimecodeIn.append(sbuf) {
+        throw cameraWriter.error ?? NSError(domain: "ScreenRecorder", code: 47, userInfo: [NSLocalizedDescriptionKey: "Failed to append camera timecode sample"])
+      }
+    }
     if let cameraWriter, cameraWriter.status == .writing {
       cameraWriter.endSession(atSourceTime: cameraLastPTS)
     }
     cameraVideoIn?.markAsFinished()
     cameraMicAudioIn?.markAsFinished()
+    cameraTimecodeIn?.markAsFinished()
 
     let group = DispatchGroup()
     group.enter()
@@ -794,5 +861,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptur
     item.value = title as NSString
     item.dataType = kCMMetadataBaseDataType_UTF8 as String
     return item
+  }
+
+  private func positiveDuration(start: CMTime, end: CMTime, fps: Int) -> CMTime {
+    let oneFrame = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
+    let d = end - start
+    if d.isValid && d > .zero { return d }
+    return oneFrame
   }
 }

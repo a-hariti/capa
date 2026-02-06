@@ -561,6 +561,7 @@ struct Capa: AsyncParsableCommand {
       // Default to CFR 60; users can opt out with --vfr.
       cfrFPS = 60
     }
+    let timecodeSync: TimecodeSyncContext? = includeCamera ? TimecodeSyncContext(fps: cfrFPS ?? 60) : nil
 
     let scaleStr = String(format: "%.2f", geometry.pointPixelScale)
 
@@ -621,7 +622,8 @@ struct Capa: AsyncParsableCommand {
       includeCamera: includeCamera,
       cameraDeviceID: cameraDevice?.uniqueID,
       cameraOutputURL: cameraOutFile,
-      onAudioLevel: onAudioLevel
+      onAudioLevel: onAudioLevel,
+      timecodeSync: timecodeSync
     )
     let recorder = ScreenRecorder(filter: filter, options: recorderOptions)
 
