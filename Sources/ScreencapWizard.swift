@@ -918,6 +918,7 @@ struct Capa: AsyncParsableCommand {
     }
 
     do {
+      meters.zero()
       ticker.stop()
       try await recorder.stop()
     } catch {

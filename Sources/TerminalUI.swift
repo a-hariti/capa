@@ -372,6 +372,9 @@ final class ElapsedTicker {
 
   func stop() {
     guard let t = timer else { return }
+    // Force one last update to ensure final state (e.g. zeroed meters) is rendered.
+    queue.sync { self.tick() }
+
     timer = nil
     running = false
     t.cancel()

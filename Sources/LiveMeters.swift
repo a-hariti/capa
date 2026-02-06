@@ -45,6 +45,13 @@ final class LiveMeters: @unchecked Sendable {
     }
   }
 
+  func zero() {
+    lock.lock()
+    defer { lock.unlock() }
+    mic = State()
+    sys = State()
+  }
+
   func render(includeMicrophone: Bool, includeSystemAudio: Bool) -> String {
     let now = CFAbsoluteTimeGetCurrent()
     lock.lock()
