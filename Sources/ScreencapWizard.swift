@@ -104,9 +104,6 @@ struct Capa: AsyncParsableCommand {
   @Option(name: .customLong("duration"), help: "Auto-stop after N seconds (non-interactive friendly)")
   var durationSeconds: Int?
 
-  @Option(name: [.customLong("out"), .customLong("output")], help: "Output directory root (default: recs/<project>/screen.mov)")
-  var outputPath: String?
-
   @Option(name: .customLong("project-name"), help: "Project folder name (default: capa-<timestamp>)")
   var projectName: String?
 
@@ -691,68 +688,20 @@ struct Capa: AsyncParsableCommand {
 
     let outFile: URL
     let cameraOutFile: URL?
-    if let outputPath = outputPath {
-      let u = URL(fileURLWithPath: outputPath)
-      if u.pathExtension.isEmpty {
-        let cameraFilename: String? = {
-          guard includeCamera else { return nil }
-          if let cameraDevice { return "\(slugifyFilenameStem(cameraDevice.localizedName)).mov" }
-          return "camera.mov"
-        }()
-        let expected = ["screen.mov"] + (cameraFilename.map { [$0] } ?? [])
-        let (uniqueName, projectDir) = ensureUniqueProjectDir(parent: u, name: finalProjectName, expectedFilenames: expected)
-        finalProjectName = uniqueName
-        try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
-        outFile = projectDir.appendingPathComponent("screen.mov")
-        if includeCamera, let cameraDevice {
-          cameraOutFile = projectDir.appendingPathComponent("\(slugifyFilenameStem(cameraDevice.localizedName)).mov")
-        } else {
-          cameraOutFile = includeCamera ? projectDir.appendingPathComponent("camera.mov") : nil
-        }
-      } else {
-        try? FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if fileExists(u) {
-          if nonInteractive {
-            var i = 2
-            var candidate = u
-            while i < 10_000 {
-              let base = u.deletingPathExtension().lastPathComponent
-              let ext = u.pathExtension
-              let alt = u.deletingLastPathComponent().appendingPathComponent("\(base)-\(i).\(ext)")
-              if !fileExists(alt) { candidate = alt; break }
-              i += 1
-            }
-            outFile = candidate
-          } else {
-            print("Error: output file already exists at \(abbreviateHomePath(u.path)). Choose a different --out/--project-name.")
-            return
-          }
-        } else {
-          outFile = u
-        }
-        if includeCamera {
-          let base = u.deletingPathExtension().lastPathComponent
-          cameraOutFile = u.deletingLastPathComponent().appendingPathComponent(base + "-camera.mov")
-        } else {
-          cameraOutFile = nil
-        }
-      }
+    let cameraFilename: String? = {
+      guard includeCamera else { return nil }
+      if let cameraDevice { return "\(slugifyFilenameStem(cameraDevice.localizedName)).mov" }
+      return "camera.mov"
+    }()
+    let expected = ["screen.mov"] + (cameraFilename.map { [$0] } ?? [])
+    let (uniqueName, projectDir) = ensureUniqueProjectDir(parent: recsDir, name: finalProjectName, expectedFilenames: expected)
+    finalProjectName = uniqueName
+    try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+    outFile = projectDir.appendingPathComponent("screen.mov")
+    if includeCamera, let cameraDevice {
+      cameraOutFile = projectDir.appendingPathComponent("\(slugifyFilenameStem(cameraDevice.localizedName)).mov")
     } else {
-      let cameraFilename: String? = {
-        guard includeCamera else { return nil }
-        if let cameraDevice { return "\(slugifyFilenameStem(cameraDevice.localizedName)).mov" }
-        return "camera.mov"
-      }()
-      let expected = ["screen.mov"] + (cameraFilename.map { [$0] } ?? [])
-      let (uniqueName, projectDir) = ensureUniqueProjectDir(parent: recsDir, name: finalProjectName, expectedFilenames: expected)
-      finalProjectName = uniqueName
-      try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
-      outFile = projectDir.appendingPathComponent("screen.mov")
-      if includeCamera, let cameraDevice {
-        cameraOutFile = projectDir.appendingPathComponent("\(slugifyFilenameStem(cameraDevice.localizedName)).mov")
-      } else {
-        cameraOutFile = includeCamera ? projectDir.appendingPathComponent("camera.mov") : nil
-      }
+      cameraOutFile = includeCamera ? projectDir.appendingPathComponent("camera.mov") : nil
     }
 
     let hasMic = includeMic
