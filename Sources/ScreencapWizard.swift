@@ -58,10 +58,26 @@ enum CameraSelection: Sendable {
   case id(String)
 }
 
+enum MicrophoneSelection: Sendable {
+  case index(Int)
+  case id(String)
+}
+
 func parseCameraSelection(_ raw: String) throws -> CameraSelection {
   let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
   if value.isEmpty {
     throw ValidationError("Invalid --camera value: empty")
+  }
+  if let index = Int(value) {
+    return .index(index)
+  }
+  return .id(value)
+}
+
+func parseMicrophoneSelection(_ raw: String) throws -> MicrophoneSelection {
+  let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+  if value.isEmpty {
+    throw ValidationError("Invalid --mic value: empty")
   }
   if let index = Int(value) {
     return .index(index)
@@ -87,11 +103,8 @@ struct Capa: AsyncParsableCommand {
   @Option(name: .customLong("display-index"), help: "Select display by index (from --list-displays)")
   var displayIndex: Int?
 
-  @Option(name: .customLong("mic-index"), help: "Select microphone by index (from --list-mics)")
-  var microphoneIndex: Int?
-
-  @Option(name: .customLong("mic-id"), help: "Select microphone by AVCaptureDevice.uniqueID")
-  var microphoneID: String?
+  @Option(name: .customLong("mic"), help: "Select microphone by index (from --list-mics) or AVCaptureDevice.uniqueID")
+  var microphoneSelector: String?
 
   @Option(name: .customLong("camera"), help: "Record camera by index (from --list-cameras) or AVCaptureDevice.uniqueID")
   var cameraSelector: String?
@@ -130,8 +143,11 @@ struct Capa: AsyncParsableCommand {
     if let displayIndex, displayIndex < 0 {
       throw ValidationError("--display-index must be >= 0")
     }
-    if let microphoneIndex, microphoneIndex < 0 {
-      throw ValidationError("--mic-index must be >= 0")
+    if let microphoneSelector {
+      let parsed = try parseMicrophoneSelection(microphoneSelector)
+      if case .index(let microphoneIndex) = parsed, microphoneIndex < 0 {
+        throw ValidationError("--mic must be >= 0 when using an index")
+      }
     }
     if let cameraSelector {
       let parsed = try parseCameraSelection(cameraSelector)
@@ -153,8 +169,8 @@ struct Capa: AsyncParsableCommand {
     }
     if let audioSpec {
       let parsed = try AudioRouting.parse(audioSpec)
-      if !parsed.includeMicrophone, (microphoneIndex != nil || microphoneID != nil) {
-        throw ValidationError("--audio \(audioSpec) does not include microphone; remove --mic-index/--mic-id or include mic")
+      if !parsed.includeMicrophone, microphoneSelector != nil {
+        throw ValidationError("--audio \(audioSpec) does not include microphone; remove --mic or include mic")
       }
     }
   }
@@ -331,23 +347,28 @@ struct Capa: AsyncParsableCommand {
       includeMic = routing.includeMicrophone
     }
 
+    let parsedMicrophoneSelection = try microphoneSelector.map(parseMicrophoneSelection)
+
     if !includeMic {
       includeMic = false
       audioDevice = nil
-    } else if let idx = microphoneIndex {
-      guard idx >= 0 && idx < audioDevices.count else {
-        print("Error: --mic-index out of range (0...\(max(0, audioDevices.count - 1)))")
-        return
+    } else if let parsedMicrophoneSelection {
+      switch parsedMicrophoneSelection {
+      case .index(let idx):
+        guard idx >= 0 && idx < audioDevices.count else {
+          print("Error: --mic index out of range (0...\(max(0, audioDevices.count - 1)))")
+          return
+        }
+        audioDevice = audioDevices[idx]
+        includeMic = true
+      case .id(let id):
+        guard let d = audioDevices.first(where: { $0.uniqueID == id }) else {
+          print("Error: no microphone with id \(id)")
+          return
+        }
+        audioDevice = d
+        includeMic = true
       }
-      audioDevice = audioDevices[idx]
-      includeMic = true
-    } else if let id = microphoneID {
-      guard let d = audioDevices.first(where: { $0.uniqueID == id }) else {
-        print("Error: no microphone with id \(id)")
-        return
-      }
-      audioDevice = d
-      includeMic = true
     } else if audioRouting?.includeMicrophone == true {
       guard !audioDevices.isEmpty else {
         print("Error: --audio requires a microphone but none were found")
@@ -395,7 +416,7 @@ struct Capa: AsyncParsableCommand {
     }
     if !nonInteractive { steps.append(.display) }
     if audioRouting == nil { steps.append(.audio) }
-    if microphoneIndex == nil && microphoneID == nil && !nonInteractive && !audioDevices.isEmpty {
+    if parsedMicrophoneSelection == nil && !nonInteractive && !audioDevices.isEmpty {
       steps.append(.microphone)
     }
     if parsedCameraSelection == nil && !nonInteractive && !videoDevices.isEmpty {
