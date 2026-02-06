@@ -1085,7 +1085,7 @@ struct Capa: AsyncParsableCommand {
       print("Recording...")
     }
 
-    let stopSignal = DispatchSemaphore(value: 0)
+    let (stopStream, stopContinuation) = AsyncStream.makeStream(of: Void.self)
 
     // Key listener.
     if canReadKeys {
@@ -1095,7 +1095,7 @@ struct Capa: AsyncParsableCommand {
         while true {
           let key = Terminal.readKey()
           if case .char(let c) = key, c == "q" || c == "Q" {
-            stopSignal.signal()
+            stopContinuation.yield()
             return
           }
         }
@@ -1105,14 +1105,14 @@ struct Capa: AsyncParsableCommand {
     // SIGINT listener.
     signal(SIGINT, SIG_IGN)
     let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-    sigintSource.setEventHandler { stopSignal.signal() }
+    sigintSource.setEventHandler { stopContinuation.yield() }
     sigintSource.resume()
 
     let duration = durationSeconds
       ?? (ProcessInfo.processInfo.environment["SCREENCAP_AUTOSTOP_SECONDS"].flatMap { Int($0) })
     if let seconds = duration, seconds > 0 {
       print("Auto-stop: \(seconds)s")
-      DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(seconds)) { stopSignal.signal() }
+      DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(seconds)) { stopContinuation.yield() }
     }
 
     var suffix: (@Sendable () -> String)?
@@ -1133,11 +1133,8 @@ struct Capa: AsyncParsableCommand {
       return
     }
 
-    await withCheckedContinuation { cont in
-      DispatchQueue.global().async {
-        stopSignal.wait()
-        cont.resume()
-      }
+    for await _ in stopStream {
+      break
     }
 
     do {
