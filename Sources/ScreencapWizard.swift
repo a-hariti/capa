@@ -129,6 +129,36 @@ struct Capa: AsyncParsableCommand {
     abstract: "Native macOS screen recorder (QuickTime-like output)."
   )
 
+  @Option(
+    name: [.short, .customLong("project-name")],
+    help: ArgumentHelp("Project folder name (default: capa-<timestamp>)", valueName: "name")
+  )
+  var projectName: String?
+
+  @Option(name: .customLong("display"), help: "Select display by index (from --list-displays) or displayID")
+  var displaySelector: String?
+
+  @Option(name: .customLong("audio"), help: "Audio sources: (none, mic, system, mic+system)")
+  var audioSpec: String?
+
+  @Option(name: .customLong("mic"), help: "Select microphone by index (from --list-mics) or AVCaptureDevice.uniqueID")
+  var microphoneSelector: String?
+
+  @Option(name: .customLong("camera"), help: "Record camera by index (from --list-cameras) or AVCaptureDevice.uniqueID")
+  var cameraSelector: String?
+
+  @Option(name: .customLong("fps"), help: "Screen timing mode: integer CFR fps or 'vfr' (default: 60)")
+  var fpsSelector: String?
+
+  @Option(name: .customLong("codec"), help: "Video codec (h264|hevc)")
+  var codecString: String?
+
+  @Option(name: .customLong("safe-mix"), help: "Safe master limiter: on|off")
+  var safeMixMode: OnOffMode = .on
+
+  @Option(name: .customLong("duration"), help: "Auto-stop after N seconds (non-interactive friendly)")
+  var durationSeconds: Int?
+
   @Flag(name: [.customLong("list-displays")], help: "List available displays and exit")
   var listDisplays = false
 
@@ -137,33 +167,6 @@ struct Capa: AsyncParsableCommand {
 
   @Flag(name: [.customLong("list-cameras")], help: "List available cameras and exit")
   var listCameras = false
-
-  @Option(name: .customLong("display"), help: "Select display by index (from --list-displays) or displayID")
-  var displaySelector: String?
-
-  @Option(name: .customLong("mic"), help: "Select microphone by index (from --list-mics) or AVCaptureDevice.uniqueID")
-  var microphoneSelector: String?
-
-  @Option(name: .customLong("camera"), help: "Record camera by index (from --list-cameras) or AVCaptureDevice.uniqueID")
-  var cameraSelector: String?
-
-  @Option(name: .customLong("audio"), help: "Audio sources: (none, mic, system, mic+system)")
-  var audioSpec: String?
-
-  @Option(name: .customLong("safe-mix"), help: "Safe master limiter: on|off")
-  var safeMixMode: OnOffMode = .on
-
-  @Option(name: .customLong("fps"), help: "Screen timing mode: integer CFR fps or 'vfr' (default: 60)")
-  var fpsSelector: String?
-
-  @Option(name: .customLong("codec"), help: "Video codec (h264|hevc)")
-  var codecString: String?
-
-  @Option(name: .customLong("duration"), help: "Auto-stop after N seconds (non-interactive friendly)")
-  var durationSeconds: Int?
-
-  @Option(name: .customLong("project-name"), help: "Project folder name (default: capa-<timestamp>)")
-  var projectName: String?
 
   @Flag(name: .customLong("no-open"), help: "Do not open file when done")
   var noOpenFlag = false
