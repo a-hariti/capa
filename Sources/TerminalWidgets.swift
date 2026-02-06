@@ -2,14 +2,19 @@ import Foundation
 import Darwin
 
 enum Ansi {
+  static let escape = "\u{001B}"
   static let reset = "\u{001B}[0m"
   static let hideCursor = "\u{001B}[?25l"
   static let showCursor = "\u{001B}[?25h"
   static let bold = "\u{001B}[1m"
   static let dim = "\u{001B}[2m"
+  static let clearLine = "\u{001B}[2K"
+  static let carriageReturn = "\r"
 
   static func fg256(_ n: Int) -> String { "\u{001B}[38;5;\(n)m" }
   static func bg256(_ n: Int) -> String { "\u{001B}[48;5;\(n)m" }
+  static func cursorUp(_ lines: Int) -> String { "\(escape)[\(max(0, lines))A" }
+  static func cursorDown(_ lines: Int) -> String { "\(escape)[\(max(0, lines))B" }
 
   static func visibleWidth(_ s: String) -> Int {
     // Best-effort terminal "cell" width, ignoring ANSI escape sequences and common zero-width scalars.
@@ -126,19 +131,29 @@ final class ProgressBar: @unchecked Sendable {
   private let fd: UnsafeMutablePointer<FILE> = stderr
   private let prefix: String
   private let total: Int64
+  private let subtitle: String?
   private var lastVisibleLen = 0
   private var lastUnits: Int = -1
   private var active = false
+  private var subtitleRendered = false
 
-  init(prefix: String, total: Int64) {
+  init(prefix: String, total: Int64, subtitle: String? = nil) {
     self.prefix = prefix
     self.total = max(1, total)
+    self.subtitle = Self.normalized(subtitle)
   }
 
   func startIfTTY() {
     guard isatty(fileno(fd)) != 0 else { return }
     active = true
     write(Ansi.hideCursor)
+    if let subtitle {
+      // Reserve two lines under the bar so there's a blank separator line.
+      write("\n\n")
+      write(TUITheme.label(subtitle))
+      write(Ansi.cursorUp(2) + Ansi.carriageReturn)
+      subtitleRendered = true
+    }
   }
 
   func update(completed: Int64) {
@@ -167,14 +182,29 @@ final class ProgressBar: @unchecked Sendable {
     let visibleLen = Ansi.visibleWidth(s)
     let pad = max(0, lastVisibleLen - visibleLen)
     lastVisibleLen = visibleLen
-    write("\r" + s + String(repeating: " ", count: pad))
+    write(Ansi.carriageReturn + s + String(repeating: " ", count: pad))
   }
 
-  func stop() {
+  func stop(finalSubtitle: String? = nil) {
     guard active else { return }
     active = false
     update(completed: total)
-    write("\n")
+    let finalLine = Self.normalized(finalSubtitle)
+    if subtitleRendered {
+      write(Ansi.cursorDown(2) + Ansi.carriageReturn)
+      if let finalLine {
+        write(Ansi.clearLine + Ansi.carriageReturn)
+        write(TUITheme.label(finalLine))
+      }
+      write("\n")
+      subtitleRendered = false
+    } else {
+      if let finalLine {
+        write("\n")
+        write(TUITheme.label(finalLine))
+      }
+      write("\n")
+    }
     write(Ansi.showCursor)
   }
 
@@ -183,6 +213,11 @@ final class ProgressBar: @unchecked Sendable {
       fputs(cstr, fd)
       fflush(fd)
     }
+  }
+
+  private static func normalized(_ line: String?) -> String? {
+    guard let line, !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+    return line
   }
 }
 

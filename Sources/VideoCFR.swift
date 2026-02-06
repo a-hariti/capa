@@ -6,7 +6,16 @@ import VideoToolbox
 /// Rewrites a `.mov` in-place to a constant frame rate by re-encoding video on an exact time grid.
 /// Audio tracks are passed through as-is (all embedded audio tracks are preserved).
 enum VideoCFR {
-  static func rewriteInPlace(url: URL, fps: Int) async throws {
+  struct Cancelled: Error, LocalizedError {
+    var errorDescription: String? { "Transcoding cancelled by user" }
+  }
+
+  static func rewriteInPlace(
+    url: URL,
+    fps: Int,
+    shouldCancel: @escaping @Sendable () -> Bool = { false },
+    cancelHint: String? = nil
+  ) async throws {
     let asset = AVURLAsset(url: url)
 
     let videoTracks = try await asset.loadTracks(withMediaType: .video)
@@ -18,7 +27,22 @@ enum VideoCFR {
     let tmpURL = url.deletingLastPathComponent()
       .appendingPathComponent(".capa-cfr-\(UUID().uuidString).mov")
 
-    try await rewrite(asset: asset, videoTracks: videoTracks, audioTracks: audioTracks, outputURL: tmpURL, fps: fps)
+    do {
+      try await rewrite(
+        asset: asset,
+        videoTracks: videoTracks,
+        audioTracks: audioTracks,
+        outputURL: tmpURL,
+        fps: fps,
+        shouldCancel: shouldCancel,
+        cancelHint: cancelHint
+      )
+    } catch {
+      if error is Cancelled {
+        try? FileManager.default.removeItem(at: tmpURL)
+      }
+      throw error
+    }
 
     let fm = FileManager.default
     _ = try? fm.replaceItemAt(url, withItemAt: tmpURL, backupItemName: nil, options: .usingNewMetadataOnly)
@@ -39,7 +63,9 @@ enum VideoCFR {
     videoTracks: [AVAssetTrack],
     audioTracks: [AVAssetTrack],
     outputURL: URL,
-    fps: Int
+    fps: Int,
+    shouldCancel: @escaping @Sendable () -> Bool,
+    cancelHint: String?
   ) async throws {
     let reader = try AVAssetReader(asset: asset)
     let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
@@ -240,7 +266,13 @@ enum VideoCFR {
     // Append timecode samples synchronously before driving video/audio.
     for p in timecodePipes {
       while let sbuf = p.out.copyNextSampleBuffer() {
+        if shouldCancel() {
+          throw Cancelled()
+        }
         while !p.input.isReadyForMoreMediaData {
+          if shouldCancel() {
+            throw Cancelled()
+          }
           try? await Task.sleep(nanoseconds: 1_000_000)
         }
         if !p.input.append(sbuf) {
@@ -258,6 +290,7 @@ enum VideoCFR {
       let fps: Int
       let startPTS: CMTime
       let endPTS: CMTime
+      let shouldCancel: @Sendable () -> Bool
 
       struct VideoState {
         let out: AVAssetReaderTrackOutput
@@ -287,6 +320,7 @@ enum VideoCFR {
         fps: Int,
         startPTS: CMTime,
         endPTS: CMTime,
+        shouldCancel: @escaping @Sendable () -> Bool,
         videoSetups: [VideoSetup],
         firstVideo: [CMSampleBuffer],
         audio: [AudioPipe],
@@ -297,6 +331,7 @@ enum VideoCFR {
         self.fps = fps
         self.startPTS = startPTS
         self.endPTS = endPTS
+        self.shouldCancel = shouldCancel
         precondition(videoSetups.count == firstVideo.count)
         self.videos = zip(videoSetups, firstVideo).map { setup, first in
           var vs = VideoState(out: setup.out, input: setup.input, adaptor: setup.adaptor, next: first, lastPixel: nil)
@@ -313,6 +348,10 @@ enum VideoCFR {
 
       func failIfNeeded() -> Bool {
         if failure != nil { return true }
+        if shouldCancel() {
+          failure = Cancelled()
+          return true
+        }
         if writer.status == .failed {
           failure = writer.error ?? NSError(domain: "VideoCFR", code: 20, userInfo: [NSLocalizedDescriptionKey: "Writer failed"])
           return true
@@ -423,70 +462,96 @@ enum VideoCFR {
       fps: fps,
       startPTS: minPTS,
       endPTS: endPTS,
+      shouldCancel: shouldCancel,
       videoSetups: videoSetups,
       firstVideo: firstVideoSamples,
       audio: audioPipes,
       firstAudio: firstAudioSamples
     )
 
-    let progress = ProgressBar(prefix: "", total: totalFramesEstimate)
+    let progress = ProgressBar(prefix: "", total: totalFramesEstimate, subtitle: cancelHint)
     progress.startIfTTY()
 
-    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
-      final class AwaitState: @unchecked Sendable {
-        let cont: CheckedContinuation<Void, any Error>
-        let state: State
-        var remaining: Int
-        var finished = false
+    do {
+      try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
+        final class AwaitState: @unchecked Sendable {
+          let cont: CheckedContinuation<Void, any Error>
+          let state: State
+          var remaining: Int
+          var finished = false
+          var cancelTimer: DispatchSourceTimer?
 
-        init(cont: CheckedContinuation<Void, any Error>, state: State, remaining: Int) {
-          self.cont = cont
-          self.state = state
-          self.remaining = remaining
-        }
-      }
-
-      let awaitState = AwaitState(cont: cont, state: state, remaining: state.videos.count + audioPipes.count)
-
-      let finish: @Sendable (Error?) -> Void = { error in
-        guard !awaitState.finished else { return }
-        awaitState.finished = true
-        if let error {
-          awaitState.cont.resume(throwing: error)
-        } else {
-          awaitState.cont.resume(returning: ())
-        }
-      }
-
-      let partDone: @Sendable () -> Void = {
-        awaitState.remaining -= 1
-        if awaitState.remaining <= 0 {
-          finish(awaitState.state.failure)
-        }
-      }
-
-      for i in 0..<state.videos.count {
-        state.videos[i].input.requestMediaDataWhenReady(on: q) {
-          state.stepVideo(i: i)
-          progress.update(completed: state.videos.first?.frameIndex ?? 0)
-          if let err = state.failure { finish(err); return }
-          if state.videos[i].done && !state.videos[i].signaled {
-            state.videos[i].signaled = true
-            partDone()
+          init(cont: CheckedContinuation<Void, any Error>, state: State, remaining: Int) {
+            self.cont = cont
+            self.state = state
+            self.remaining = remaining
           }
         }
-      }
 
-      for i in 0..<state.audio.count {
-        state.audio[i].input.requestMediaDataWhenReady(on: q) {
-          state.stepAudio(i: i)
-          if let err = state.failure { finish(err); return }
-          if state.audioDone[i] && !state.audioSignaled[i] {
-            state.audioSignaled[i] = true
-            partDone()
+        let awaitState = AwaitState(cont: cont, state: state, remaining: state.videos.count + audioPipes.count)
+
+        let finish: @Sendable (Error?) -> Void = { error in
+          guard !awaitState.finished else { return }
+          awaitState.finished = true
+          awaitState.cancelTimer?.cancel()
+          awaitState.cancelTimer = nil
+          if let error {
+            awaitState.cont.resume(throwing: error)
+          } else {
+            awaitState.cont.resume(returning: ())
           }
         }
+
+        let partDone: @Sendable () -> Void = {
+          awaitState.remaining -= 1
+          if awaitState.remaining <= 0 {
+            finish(awaitState.state.failure)
+          }
+        }
+
+        for i in 0..<state.videos.count {
+          state.videos[i].input.requestMediaDataWhenReady(on: q) {
+            state.stepVideo(i: i)
+            progress.update(completed: state.videos.first?.frameIndex ?? 0)
+            if let err = state.failure { finish(err); return }
+            if state.videos[i].done && !state.videos[i].signaled {
+              state.videos[i].signaled = true
+              partDone()
+            }
+          }
+        }
+
+        for i in 0..<state.audio.count {
+          state.audio[i].input.requestMediaDataWhenReady(on: q) {
+            state.stepAudio(i: i)
+            if let err = state.failure { finish(err); return }
+            if state.audioDone[i] && !state.audioSignaled[i] {
+              state.audioSignaled[i] = true
+              partDone()
+            }
+          }
+        }
+
+        awaitState.cancelTimer = DispatchSource.makeTimerSource(queue: q)
+        awaitState.cancelTimer?.schedule(deadline: .now(), repeating: .milliseconds(50))
+        awaitState.cancelTimer?.setEventHandler {
+          if awaitState.finished { return }
+          if awaitState.state.failure != nil { return }
+          if awaitState.state.shouldCancel() {
+            awaitState.state.failure = Cancelled()
+            finish(awaitState.state.failure)
+          }
+        }
+        awaitState.cancelTimer?.resume()
       }
+    } catch {
+      let cancelled = error is Cancelled
+      progress.stop(finalSubtitle: cancelled ? "Skipped CFR post-process. Kept original timing." : nil)
+      if cancelled {
+        reader.cancelReading()
+        writer.cancelWriting()
+      }
+      throw error
     }
 
     await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in

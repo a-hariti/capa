@@ -73,6 +73,53 @@ enum MicrophoneSelection: Sendable {
   case id(String)
 }
 
+final class SharedFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: Bool
+
+  init(_ initialValue: Bool = false) {
+    self.value = initialValue
+  }
+
+  func get() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
+
+  func set(_ newValue: Bool = true) {
+    lock.lock()
+    value = newValue
+    lock.unlock()
+  }
+}
+
+private func readTranscodeSkipKey(timeoutMs: Int32) -> Bool {
+  var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+  let ready = poll(&fds, 1, timeoutMs)
+  guard ready > 0, (fds.revents & Int16(POLLIN)) != 0 else { return false }
+
+  var b: UInt8 = 0
+  guard read(STDIN_FILENO, &b, 1) == 1 else { return false }
+  if b == 0x03 { return true } // Ctrl+C
+  guard b == 0x1b else { return false }
+
+  // Bare Escape skips transcoding. Escape-prefixed key sequences (e.g. arrows) should not.
+  var nextFDs = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+  let hasFollowup = poll(&nextFDs, 1, 0) > 0 && (nextFDs.revents & Int16(POLLIN)) != 0
+  guard hasFollowup else { return true }
+
+  var discard: UInt8 = 0
+  _ = read(STDIN_FILENO, &discard, 1)
+  while true {
+    var pendingFDs = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+    let pending = poll(&pendingFDs, 1, 0)
+    if pending <= 0 || (pendingFDs.revents & Int16(POLLIN)) == 0 { break }
+    _ = read(STDIN_FILENO, &discard, 1)
+  }
+  return false
+}
+
 func parseDisplaySelection(_ raw: String) throws -> DisplaySelection {
   let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
   if value.isEmpty {
@@ -926,6 +973,8 @@ struct Capa: AsyncParsableCommand {
       print("Recording failed: \(error)")
       return
     }
+    sigintSource.cancel()
+    signal(SIGINT, SIG_DFL)
 
     do {
       let mixConfig = PostProcess.MixConfig(
@@ -955,17 +1004,58 @@ struct Capa: AsyncParsableCommand {
       }
     }
 
+    var didSkipCFR = false
     if let cfrFPS {
       print("")
       print("Post-processing screen video to \(cfrFPS) fps...")
+
+      let skipTranscode = SharedFlag(false)
+      let transcodeFinished = SharedFlag(false)
+      signal(SIGINT, SIG_IGN)
+      let transcodeSigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+      transcodeSigintSource.setEventHandler { skipTranscode.set() }
+      transcodeSigintSource.resume()
+      defer {
+        transcodeSigintSource.cancel()
+        signal(SIGINT, SIG_DFL)
+      }
+
+      let transcodeTask = Task {
+        defer { transcodeFinished.set() }
+        try await VideoCFR.rewriteInPlace(
+          url: outFile,
+          fps: cfrFPS,
+          shouldCancel: { skipTranscode.get() },
+          cancelHint: "Escape to skip transcoding"
+        )
+      }
+
+      if Terminal.isTTY(STDIN_FILENO) {
+        Terminal.enableRawMode(disableSignals: true)
+        defer { Terminal.disableRawMode() }
+        while !transcodeFinished.get() && !skipTranscode.get() {
+          if readTranscodeSkipKey(timeoutMs: 80) {
+            skipTranscode.set()
+            break
+          }
+        }
+      }
+
       do {
-        try await VideoCFR.rewriteInPlace(url: outFile, fps: cfrFPS)
+        try await transcodeTask.value
+      } catch is VideoCFR.Cancelled {
+        didSkipCFR = true
+        if !Terminal.isTTY(STDERR_FILENO) {
+          print("Skipped CFR post-process. Kept the original screen recording timing.")
+        }
       } catch {
         print("Warning: CFR post-process failed: \(error)")
       }
     }
 
-    print("")
+    if !didSkipCFR {
+      print("")
+    }
     if let cameraOutFile {
       print(sectionTitle("Files:"))
       print("\(isTTYOut ? TUITheme.label("  Screen:") : "  Screen:") \(abbreviateHomePath(outFile.path))")
