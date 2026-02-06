@@ -78,7 +78,7 @@ struct Capa: AsyncParsableCommand {
   @Flag(name: [.customLong("list-displays")], help: "List available displays and exit")
   var listDisplays = false
 
-  @Flag(name: [.customLong("list-mics"), .customLong("list-microphones")], help: "List available microphones and exit")
+  @Flag(name: [.customLong("list-mics")], help: "List available microphones and exit")
   var listMicrophones = false
 
   @Flag(name: [.customLong("list-cameras")], help: "List available cameras and exit")
