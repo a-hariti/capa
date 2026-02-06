@@ -18,12 +18,16 @@ Capa is a native macOS screen recorder CLI that produces high-quality, QuickTime
 - Apple Silicon (recommended).
 - Swift 6.0+ toolchain.
 
-### Build from Source
+### Homebrew
 ```bash
-git clone https://github.com/a-hariti/capa.git
-cd capa
-swift build -c release
-cp .build/release/capa /usr/local/bin/capa
+brew tap a-hariti/homebrew-capa
+brew install capa
+```
+
+Upgrade later with:
+```bash
+brew update
+brew upgrade capa
 ```
 
 ## Usage
@@ -87,6 +91,15 @@ capa --project-name "Tutorial-01" --camera 0 --audio mic
 - **Multi-source**: Records camera sidecar files with synchronized timecode tracks.
 
 ## Development
+
+### Build from Source
+
+```bash
+git clone https://github.com/a-hariti/capa.git
+cd capa
+swift build -c release
+cp .build/release/capa /usr/local/bin/capa
+```
 
 ### Project Structure
 - `Sources/`:

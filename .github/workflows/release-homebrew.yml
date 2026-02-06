@@ -1,0 +1,134 @@
+name: Release + Homebrew
+# Maintainer notes:
+# - Required secret in this repo: HOMEBREW_TAP_TOKEN
+#   Token must be able to push to the tap repository.
+# - Optional repo variable: HOMEBREW_TAP_REPO (format: owner/repo)
+# - If HOMEBREW_TAP_REPO is unset, default tap is <repo-owner>/homebrew-capa.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without leading v (e.g. 0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-15
+    env:
+      BIN_NAME: capa
+      REPO_OWNER: ${{ github.repository_owner }}
+      REPO_NAME: ${{ github.event.repository.name }}
+      TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            tag="${{ github.event.release.tag_name }}"
+            version="${tag#v}"
+          else
+            version="${{ inputs.version }}"
+            tag="v${version}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        shell: bash
+        run: swift build -c release
+
+      - name: Validate CLI version matches release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ steps.version.outputs.version }}"
+          actual="$(.build/release/${BIN_NAME} --version | tr -d '[:space:]')"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Version mismatch: binary reports '$actual' but release expects '$expected'." >&2
+            exit 1
+          fi
+
+      - name: Package artifact
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          artifact="${BIN_NAME}-v${version}-macos-arm64.tar.gz"
+          mkdir -p dist
+          cp ".build/release/${BIN_NAME}" "dist/${BIN_NAME}"
+          tar -C dist -czf "dist/${artifact}" "${BIN_NAME}"
+          sha=$(shasum -a 256 "dist/${artifact}" | awk '{print $1}')
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: dist/${{ steps.package.outputs.artifact }}
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+
+      - name: Select tap repo
+        id: tap
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Allow overriding the tap repo via Actions variable.
+          tap_repo="${TAP_REPO}"
+          if [[ -z "$tap_repo" ]]; then
+            # Default tap naming convention for this project.
+            tap_repo="${REPO_OWNER}/homebrew-capa"
+          fi
+          echo "repo=$tap_repo" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew tap formula
+        shell: bash
+        env:
+          # PAT used to clone/push the tap repository.
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping tap update." >&2
+            exit 1
+          fi
+
+          tag="${{ steps.version.outputs.tag }}"
+          version="${{ steps.version.outputs.version }}"
+          artifact="${{ steps.package.outputs.artifact }}"
+          sha="${{ steps.package.outputs.sha256 }}"
+          tap_repo="${{ steps.tap.outputs.repo }}"
+          asset_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${tag}/${artifact}"
+
+          temp_dir="$(mktemp -d)"
+          trap 'rm -rf "$temp_dir"' EXIT
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${tap_repo}.git" "$temp_dir/tap"
+          mkdir -p "$temp_dir/tap/Formula"
+
+          scripts/generate_homebrew_formula.sh "$version" "$asset_url" "$sha" > "$temp_dir/tap/Formula/capa.rb"
+
+          pushd "$temp_dir/tap" > /dev/null
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/capa.rb
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit."
+            exit 0
+          fi
+          git commit -m "capa ${version}"
+          git push origin HEAD
+          popd > /dev/null
