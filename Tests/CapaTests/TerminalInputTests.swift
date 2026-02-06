@@ -3,13 +3,13 @@ import XCTest
 
 final class TerminalInputTests: XCTestCase {
   func testDecodeUTF8CharacterASCII() {
-    let c = Terminal.decodeUTF8Character(startByte: 0x41, readNextByte: { _ in nil })
+    let c = TerminalController.decodeUTF8Character(startByte: 0x41, readNextByte: { _ in nil })
     XCTAssertEqual(c, "A")
   }
 
   func testDecodeUTF8CharacterTwoByteSequence() {
     var remaining: [UInt8] = [0xA9]
-    let c = Terminal.decodeUTF8Character(startByte: 0xC3, readNextByte: { _ in
+    let c = TerminalController.decodeUTF8Character(startByte: 0xC3, readNextByte: { _ in
       guard !remaining.isEmpty else { return nil }
       return remaining.removeFirst()
     })
@@ -20,7 +20,7 @@ final class TerminalInputTests: XCTestCase {
 
   func testDecodeUTF8CharacterFourByteSequence() {
     var remaining: [UInt8] = [0x9F, 0x8E, 0xA5]
-    let c = Terminal.decodeUTF8Character(startByte: 0xF0, readNextByte: { _ in
+    let c = TerminalController.decodeUTF8Character(startByte: 0xF0, readNextByte: { _ in
       guard !remaining.isEmpty else { return nil }
       return remaining.removeFirst()
     })
@@ -31,7 +31,7 @@ final class TerminalInputTests: XCTestCase {
 
   func testDecodeUTF8CharacterRejectsInvalidContinuation() {
     var remaining: [UInt8] = [0x41]
-    let c = Terminal.decodeUTF8Character(startByte: 0xC3, readNextByte: { _ in
+    let c = TerminalController.decodeUTF8Character(startByte: 0xC3, readNextByte: { _ in
       guard !remaining.isEmpty else { return nil }
       return remaining.removeFirst()
     })

@@ -268,7 +268,8 @@ struct Capa: AsyncParsableCommand {
   }
 
   mutating func run() async throws {
-    let isTTYOut = Terminal.isTTY(STDOUT_FILENO)
+    let terminal = TerminalController()
+    let isTTYOut = TerminalController.isTTY(STDOUT_FILENO)
     let banner = isTTYOut
       ? "Capa \(TUITheme.label("(native macOS screen capture)"))"
       : "Capa (native macOS screen capture)"
@@ -683,7 +684,7 @@ struct Capa: AsyncParsableCommand {
       let allowBack = previousRewindableStepIndex(from: stepCursor) != nil
       switch steps[stepCursor] {
       case .projectName:
-        switch promptEditableDefault(title: "Project Name", defaultValue: defaultProjectName) {
+        switch promptEditableDefault(terminal: terminal, title: "Project Name", defaultValue: defaultProjectName) {
         case .submitted(let value):
           selectedProjectName = sanitizeProjectName(value)
           print("")
@@ -704,6 +705,7 @@ struct Capa: AsyncParsableCommand {
         } else {
           let displayOptions = content.displays.map(displayLabel)
           let result = selectOptionWithBack(
+            terminal: terminal,
             title: "Display",
             options: displayOptions,
             defaultIndex: displayDefaultIndex,
@@ -730,6 +732,7 @@ struct Capa: AsyncParsableCommand {
 
       case .cursor:
         let result = selectOptionWithBack(
+          terminal: terminal,
           title: "Show Cursor",
           summaryLabel: "Cursor",
           options: ["Yes", "No"],
@@ -755,6 +758,7 @@ struct Capa: AsyncParsableCommand {
 
       case .menuBar:
         let result = selectOptionWithBack(
+          terminal: terminal,
           title: "Show Menu Bar",
           summaryLabel: "Menu Bar",
           options: ["Yes", "No"],
@@ -780,6 +784,7 @@ struct Capa: AsyncParsableCommand {
 
       case .audio:
         let result = selectOptionWithBack(
+          terminal: terminal,
           title: "Audio",
           options: ["Mic", "System", "Mic + System", "None"],
           defaultIndex: audioDefaultIndex,
@@ -824,6 +829,7 @@ struct Capa: AsyncParsableCommand {
         }
         let options = audioDevices.map(microphoneLabel)
         let result = selectOptionWithBack(
+          terminal: terminal,
           title: "Microphone",
           options: options,
           defaultIndex: min(microphoneDefaultIndex, max(0, options.count - 1)),
@@ -847,6 +853,7 @@ struct Capa: AsyncParsableCommand {
       case .camera:
         let options = ["No camera"] + videoDevices.map(cameraLabel)
         let result = selectOptionWithBack(
+          terminal: terminal,
           title: "Camera",
           options: options,
           defaultIndex: cameraDefaultIndex,
@@ -875,6 +882,7 @@ struct Capa: AsyncParsableCommand {
       case .codec:
         let codecOptions = ["H.264", "H.265/HEVC"]
         let result = selectOptionWithBack(
+          terminal: terminal,
           title: "Video Codec",
           options: codecOptions,
           defaultIndex: codecDefaultIndex,
@@ -1021,7 +1029,7 @@ struct Capa: AsyncParsableCommand {
     let hasSystemAudio = audioRouting.includeSystemAudio
 
     let meters = LiveMeters()
-    let showMeters = Terminal.isTTY(fileno(stderr)) && (hasMic || hasSystemAudio)
+    let showMeters = TerminalController.isTTY(fileno(stderr)) && (hasMic || hasSystemAudio)
     var onAudioLevel: (@Sendable (ScreenRecorder.AudioSource, AudioPeak) -> Void)?
     if showMeters {
       onAudioLevel = { source, peak in meters.update(source: source, peak: peak) }
@@ -1070,7 +1078,7 @@ struct Capa: AsyncParsableCommand {
       print(muted("  System audio: \(audioRouting.includeSystemAudio ? "on" : "off")"))
       print("")
     }
-    let canReadKeys = Terminal.isTTY(STDIN_FILENO)
+    let canReadKeys = TerminalController.isTTY(STDIN_FILENO)
     if !verbose {
       print("")
     }
@@ -1085,10 +1093,10 @@ struct Capa: AsyncParsableCommand {
     // Key listener.
     if canReadKeys {
       DispatchQueue.global().async {
-        Terminal.enableRawMode()
-        defer { Terminal.disableRawMode() }
+        terminal.enableRawMode()
+        defer { terminal.disableRawMode() }
         while true {
-          let key = Terminal.readKey()
+          let key = terminal.readKey()
           if case .char(let c) = key, c == "q" || c == "Q" {
             stopContinuation.yield()
             return
@@ -1198,9 +1206,9 @@ struct Capa: AsyncParsableCommand {
         )
       }
 
-      if Terminal.isTTY(STDIN_FILENO) {
-        Terminal.enableRawMode(disableSignals: true)
-        defer { Terminal.disableRawMode() }
+      if TerminalController.isTTY(STDIN_FILENO) {
+        terminal.enableRawMode(disableSignals: true)
+        defer { terminal.disableRawMode() }
         while true {
           let finished = await transcodeFinished.get()
           let skipped = await skipTranscode.get()
@@ -1216,7 +1224,7 @@ struct Capa: AsyncParsableCommand {
         try await transcodeTask.value
       } catch is VideoCFR.Cancelled {
         didSkipCFR = true
-        if !Terminal.isTTY(STDERR_FILENO) {
+        if !TerminalController.isTTY(STDERR_FILENO) {
           print("Skipped CFR post-process. Kept the original screen recording timing.")
         }
       } catch {

@@ -45,19 +45,26 @@ enum Key {
   case unknown
 }
 
-final class Terminal {
-  nonisolated(unsafe) private static var original = termios()
-  nonisolated(unsafe) private static var rawEnabled = false
+final class TerminalController: @unchecked Sendable {
+  private var original = termios()
+  private var rawEnabled = false
 
   static func isTTY(_ fd: Int32) -> Bool {
     isatty(fd) != 0
   }
 
-  static func enableRawMode(disableSignals: Bool = false) {
+  static func columns(_ fd: Int32) -> Int? {
+    var ws = winsize()
+    if ioctl(fd, TIOCGWINSZ, &ws) == 0, ws.ws_col > 0 {
+      return Int(ws.ws_col)
+    }
+    return nil
+  }
+
+  func enableRawMode(disableSignals: Bool = false) {
     guard !rawEnabled else { return }
-    var raw = termios()
     tcgetattr(STDIN_FILENO, &original)
-    raw = original
+    var raw = original
     raw.c_lflag &= ~(UInt(ECHO | ICANON))
     if disableSignals {
       raw.c_lflag &= ~UInt(ISIG)
@@ -72,14 +79,14 @@ final class Terminal {
     rawEnabled = true
   }
 
-  static func disableRawMode() {
+  func disableRawMode() {
     guard rawEnabled else { return }
     var orig = original
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig)
     rawEnabled = false
   }
 
-  static func readKey() -> Key {
+  func readKey() -> Key {
     var buffer = [UInt8](repeating: 0, count: 3)
     let n = read(STDIN_FILENO, &buffer, 1)
     if n <= 0 { return .unknown }
@@ -99,7 +106,7 @@ final class Terminal {
     if buffer[0] == 0x08 || buffer[0] == 0x7f { return .backspace }
     if buffer[0] == 0x03 { return .ctrlC }
     if buffer[0] == 0x04 { return .ctrlD }
-    if let c = decodeUTF8Character(startByte: buffer[0], readNextByte: { _ in readByte(timeoutMs: 20) }) {
+    if let c = TerminalController.decodeUTF8Character(startByte: buffer[0], readNextByte: { _ in readByte(timeoutMs: 20) }) {
       return .char(c)
     }
     return .unknown
@@ -136,7 +143,7 @@ final class Terminal {
     return c
   }
 
-  private static func readByte(timeoutMs: Int32) -> UInt8? {
+  private func readByte(timeoutMs: Int32) -> UInt8? {
     var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
     let ready = poll(&fds, 1, timeoutMs)
     guard ready > 0, (fds.revents & Int16(POLLIN)) != 0 else {
@@ -147,7 +154,7 @@ final class Terminal {
     return n == 1 ? b : nil
   }
 
-  static func discardPendingInput(maxBytes: Int = 128) {
+  func discardPendingInput(maxBytes: Int = 128) {
     guard maxBytes > 0 else { return }
     var remaining = maxBytes
     while remaining > 0 {
@@ -173,8 +180,8 @@ enum TextInputResult {
   case cancel
 }
 
-func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
-  switch selectOptionWithBack(title: title, options: options, defaultIndex: defaultIndex, allowBack: false) {
+func selectOption(terminal: TerminalController, title: String, options: [String], defaultIndex: Int) -> Int {
+  switch selectOptionWithBack(terminal: terminal, title: title, options: options, defaultIndex: defaultIndex, allowBack: false) {
   case .selected(let idx):
     return idx
   case .back:
@@ -185,6 +192,7 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
 }
 
 func selectOptionWithBack(
+  terminal: TerminalController,
   title: String,
   summaryLabel: String? = nil,
   options: [String],
@@ -193,7 +201,7 @@ func selectOptionWithBack(
   summaryIndent: Int = 0,
   printSummary: Bool = true
 ) -> SelectionResult {
-  guard Terminal.isTTY(STDIN_FILENO) else {
+  guard TerminalController.isTTY(STDIN_FILENO) else {
     return .selected(min(max(defaultIndex, 0), options.count - 1))
   }
   var index = min(max(defaultIndex, 0), options.count - 1)
@@ -227,12 +235,12 @@ func selectOptionWithBack(
     print(TUITheme.muted(hint))
   }
 
-  Terminal.enableRawMode(disableSignals: true)
-  defer { Terminal.disableRawMode() }
+  terminal.enableRawMode(disableSignals: true)
+  defer { terminal.disableRawMode() }
 
   render()
   while true {
-    switch Terminal.readKey() {
+    switch terminal.readKey() {
     case .up:
       if index > 0 { index -= 1 }
     case .down:
@@ -264,7 +272,7 @@ func selectOptionWithBack(
       }
       print("\u{001B}[\(lines - 1)A", terminator: "")
       // Prevent key-repeat Esc from cascading through multiple previous steps.
-      Terminal.discardPendingInput()
+      terminal.discardPendingInput()
       return .back
     case .ctrlC, .ctrlD:
       // Remove prompt block and cancel the whole interaction gracefully.
@@ -287,8 +295,8 @@ func selectOptionWithBack(
   }
 }
 
-func promptEditableDefault(title: String, defaultValue: String) -> TextInputResult {
-  guard Terminal.isTTY(STDIN_FILENO) else {
+func promptEditableDefault(terminal: TerminalController, title: String, defaultValue: String) -> TextInputResult {
+  guard TerminalController.isTTY(STDIN_FILENO) else {
     return .submitted(defaultValue)
   }
 
@@ -301,12 +309,12 @@ func promptEditableDefault(title: String, defaultValue: String) -> TextInputResu
     fflush(stdout)
   }
 
-  Terminal.enableRawMode(disableSignals: true)
-  defer { Terminal.disableRawMode() }
+  terminal.enableRawMode(disableSignals: true)
+  defer { terminal.disableRawMode() }
 
   render()
   while true {
-    switch Terminal.readKey() {
+    switch terminal.readKey() {
     case .enter:
       print("")
       let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -380,7 +388,7 @@ final class ElapsedTicker {
 
   func startIfTTY() {
     // Only render the live-updating line when attached to a terminal.
-    let isTTY = Terminal.isTTY(fileno(fd))
+    let isTTY = TerminalController.isTTY(fileno(fd))
     guard isTTY else { return }
     start()
   }
@@ -416,7 +424,7 @@ final class ElapsedTicker {
     let timerText = TUITheme.title(format(elapsedSeconds: elapsed))
     let base = "\(TUITheme.recordingDot(prefix)) \(timerText)"
     let extra = suffix?()
-    let columns = Terminal.columns(fileno(fd))
+    let columns = TerminalController.columns(fileno(fd))
     let s = fitTickerLine(base: base, suffix: extra, maxColumns: columns)
 
     // Re-write the same line, padding any leftover characters.
@@ -453,15 +461,5 @@ final class ElapsedTicker {
     cursorHidden = false
     // ANSI: show cursor
     writeLine(Ansi.showCursor)
-  }
-}
-
-extension Terminal {
-  static func columns(_ fd: Int32) -> Int? {
-    var ws = winsize()
-    if ioctl(fd, TIOCGWINSZ, &ws) == 0, ws.ws_col > 0 {
-      return Int(ws.ws_col)
-    }
-    return nil
   }
 }
