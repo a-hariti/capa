@@ -948,7 +948,7 @@ struct Capa: AsyncParsableCommand {
     if shouldOpen {
       let p = Process()
       p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-      p.arguments = [outFile.path]
+      p.arguments = [outFile.deletingLastPathComponent().path]
       try? p.run()
     }
   }
