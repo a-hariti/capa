@@ -4,6 +4,8 @@ import Darwin
 private let wizardSummaryLabels = [
   "Project Name",
   "Display",
+  "Cursor",
+  "Menu Bar",
   "Audio",
   "Microphone",
   "Camera",
@@ -14,13 +16,14 @@ private let wizardSummaryLabelWidth = wizardSummaryLabels
   .map { Ansi.visibleWidth($0) }
   .max() ?? 0
 
-func renderWizardSummary(label: String, value: String, isTTY: Bool) -> String {
+func renderWizardSummary(label: String, value: String, isTTY: Bool, indent: Int = 0) -> String {
   let pad = max(0, wizardSummaryLabelWidth - Ansi.visibleWidth(label))
   let paddedLabel = label + String(repeating: " ", count: pad)
+  let prefix = String(repeating: " ", count: indent)
   if isTTY {
-    return "\(TUITheme.primary(paddedLabel)) \(TUITheme.label(":")) \(TUITheme.option(value))"
+    return "\(prefix)\(TUITheme.primary(paddedLabel)) \(TUITheme.label(":")) \(TUITheme.option(value))"
   }
-  return "\(paddedLabel) : \(value)"
+  return "\(prefix)\(paddedLabel) : \(value)"
 }
 
 func fitTickerLine(base: String, suffix: String?, maxColumns: Int?) -> String {
@@ -143,6 +146,20 @@ final class Terminal {
     let n = read(STDIN_FILENO, &b, 1)
     return n == 1 ? b : nil
   }
+
+  static func discardPendingInput(maxBytes: Int = 128) {
+    guard maxBytes > 0 else { return }
+    var remaining = maxBytes
+    while remaining > 0 {
+      var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+      let ready = poll(&fds, 1, 0)
+      guard ready > 0, (fds.revents & Int16(POLLIN)) != 0 else { break }
+      var b: UInt8 = 0
+      let n = read(STDIN_FILENO, &b, 1)
+      if n != 1 { break }
+      remaining -= 1
+    }
+  }
 }
 
 enum SelectionResult {
@@ -167,7 +184,15 @@ func selectOption(title: String, options: [String], defaultIndex: Int) -> Int {
   }
 }
 
-func selectOptionWithBack(title: String, options: [String], defaultIndex: Int, allowBack: Bool) -> SelectionResult {
+func selectOptionWithBack(
+  title: String,
+  summaryLabel: String? = nil,
+  options: [String],
+  defaultIndex: Int,
+  allowBack: Bool,
+  summaryIndent: Int = 0,
+  printSummary: Bool = true
+) -> SelectionResult {
   guard Terminal.isTTY(STDIN_FILENO) else {
     return .selected(min(max(defaultIndex, 0), options.count - 1))
   }
@@ -222,11 +247,13 @@ func selectOptionWithBack(title: String, options: [String], defaultIndex: Int, a
         }
       }
       print("\u{001B}[\(lines - 1)A", terminator: "")
-      let picked = splitPrimarySecondary(options[index]).primary
-      print(renderWizardSummary(label: title, value: picked, isTTY: true))
+      if printSummary {
+        let picked = splitPrimarySecondary(options[index]).primary
+        print(renderWizardSummary(label: summaryLabel ?? title, value: picked, isTTY: true, indent: summaryIndent))
+      }
       return .selected(index)
     case .escape:
-      guard allowBack else { break }
+      guard allowBack else { continue }
       // Remove current prompt block completely before navigating back.
       print("\u{001B}[\(lines)A", terminator: "")
       for n in 0..<lines {
@@ -236,6 +263,8 @@ func selectOptionWithBack(title: String, options: [String], defaultIndex: Int, a
         }
       }
       print("\u{001B}[\(lines - 1)A", terminator: "")
+      // Prevent key-repeat Esc from cascading through multiple previous steps.
+      Terminal.discardPendingInput()
       return .back
     case .ctrlC, .ctrlD:
       // Remove prompt block and cancel the whole interaction gracefully.

@@ -185,6 +185,12 @@ struct Capa: AsyncParsableCommand {
   @Option(name: .customLong("display"), help: "Select display by index (from --list-displays) or displayID")
   var displaySelector: String?
 
+  @Option(name: .customLong("cursor"), help: "Show cursor: on|off")
+  var cursorMode: OnOffMode?
+
+  @Option(name: .customLong("menubar"), help: "Show menu bar: on|off")
+  var menuBarMode: OnOffMode?
+
   @Option(name: .customLong("audio"), help: "Audio sources: (none, mic, system, mic+system)")
   var audioSpec: String?
 
@@ -384,6 +390,8 @@ struct Capa: AsyncParsableCommand {
     enum WizardStep {
       case projectName
       case display
+      case cursor
+      case menuBar
       case audio
       case microphone
       case camera
@@ -400,6 +408,8 @@ struct Capa: AsyncParsableCommand {
 
     var selectedDisplayIndex: Int?
     var selectedProjectName = projectName?.trimmingCharacters(in: .whitespacesAndNewlines)
+    var selectedCursorMode: OnOffMode? = cursorMode
+    var selectedMenuBarMode: OnOffMode? = menuBarMode
     var audioRouting: AudioRouting?
     var audioDevice: AVCaptureDevice?
     var includeMic = false
@@ -408,10 +418,35 @@ struct Capa: AsyncParsableCommand {
     var codec: AVVideoCodecType?
 
     var displayDefaultIndex = 0
+    var cursorDefaultIndex = 0
+    var menuBarDefaultIndex = 0
     var audioDefaultIndex = 1
     var microphoneDefaultIndex = 0
     var cameraDefaultIndex = 0
     var codecDefaultIndex = 0
+
+    func displayConfigurationDescription(geometry: CaptureGeometry, cursor: OnOffMode?, menuBar: OnOffMode?) -> String {
+      let base = "\(geometry.pixelWidth)x\(geometry.pixelHeight)px"
+      let c = cursor?.enabled ?? true
+      let m = menuBar?.enabled ?? true
+
+      if c && m {
+        // Only show "(full)" if at least one option was explicitly set (CLI or interactive choice),
+        // distinguishing it from the "clean start" state where everything is default/unknown.
+        if cursor == nil && menuBar == nil {
+          return base
+        }
+        return "\(base) (full)"
+      }
+      if !c && !m {
+        return "\(base) (no cursor & menu bar)"
+      }
+      if !c {
+        return "\(base) (no cursor)"
+      }
+      // !m
+      return "\(base) (no menu bar)"
+    }
 
     let parsedDisplaySelection = try displaySelector.map(parseDisplaySelection)
 
@@ -523,6 +558,8 @@ struct Capa: AsyncParsableCommand {
       steps.append(.projectName)
     }
     if parsedDisplaySelection == nil && !nonInteractive { steps.append(.display) }
+    if selectedCursorMode == nil && !nonInteractive { steps.append(.cursor) }
+    if selectedMenuBarMode == nil && !nonInteractive { steps.append(.menuBar) }
     if audioRouting == nil { steps.append(.audio) }
     if parsedMicrophoneSelection == nil && !nonInteractive && !audioDevices.isEmpty {
       steps.append(.microphone)
@@ -536,29 +573,118 @@ struct Capa: AsyncParsableCommand {
       guard let first = steps.first else { return 0 }
       return first == .display ? 1 : 0
     }()
+    func isStepActiveForBackNavigation(_ step: WizardStep) -> Bool {
+      switch step {
+      case .microphone:
+        return includeMic && !audioDevices.isEmpty
+      default:
+        return true
+      }
+    }
     func previousRewindableStepIndex(from index: Int) -> Int? {
       guard index > firstRewindableStepIndex else { return nil }
       var i = index - 1
       while i >= firstRewindableStepIndex {
-        if steps[i] != .display { return i }
+        let candidate = steps[i]
+        if candidate != .display, isStepActiveForBackNavigation(candidate) { return i }
         i -= 1
       }
       return nil
     }
 
-    var singleDisplayLinePrinted = false
+    var displaySummaryVisible = false
+    var isDisplayCollapsed = false
+    var cursorSummaryVisible = false
+    var menuBarSummaryVisible = false
     var stepCursor = 0
+
+    func selectedDisplayGeometry() -> CaptureGeometry? {
+      guard let idx = selectedDisplayIndex else { return nil }
+      let d = content.displays[idx]
+      let f = SCContentFilter(display: d, excludingWindows: [])
+      return captureGeometry(filter: f, fallbackLogicalSize: (Int(d.width), Int(d.height)))
+    }
+
+    func printDisplaySummary(cursor: OnOffMode?, menuBar: OnOffMode?) {
+      guard let geometry = selectedDisplayGeometry() else { return }
+      let desc = displayConfigurationDescription(geometry: geometry, cursor: cursor, menuBar: menuBar)
+      print(renderWizardSummary(label: "Display", value: desc, isTTY: isTTYOut))
+      displaySummaryVisible = true
+    }
+
     func rewind(to backIdx: Int) {
+      // Special handling when rewinding into the display group (Cursor/MenuBar) from a later step.
+      // If the display group was collapsed (consolidated into one line), we need to expand it back
+      // so the Cursor/MenuBar steps have their context (the base Display line + previous sub-options).
+      if isDisplayCollapsed && (steps[backIdx] == .cursor || steps[backIdx] == .menuBar) {
+        // 1. Clear the consolidated "Display: ... (full)" line.
+        clearLinesIfTTY(1)
+
+        // 2. Restore the base "Display: ...px" line.
+        printDisplaySummary(cursor: nil, menuBar: nil)
+        cursorSummaryVisible = false
+        menuBarSummaryVisible = false
+
+        // 3. If we are backing to MenuBar, restore the Cursor summary if it was previously printed.
+        if steps[backIdx] == .menuBar, let selectedCursorMode {
+          let val = selectedCursorMode.enabled ? "Yes" : "No"
+          print(renderWizardSummary(label: "Cursor", value: val, isTTY: isTTYOut, indent: 2))
+          cursorSummaryVisible = true
+        }
+
+        isDisplayCollapsed = false
+        stepCursor = backIdx
+        return
+      }
+
       clearLinesIfTTY(1)
       if steps[backIdx] == .projectName {
         // Remove spacer + project summary so the editable line is re-rendered cleanly.
         clearLinesIfTTY(2)
-        singleDisplayLinePrinted = false
+        displaySummaryVisible = false
+        cursorSummaryVisible = false
+        menuBarSummaryVisible = false
+      } else if steps[backIdx] == .display {
+        displaySummaryVisible = false
+        cursorSummaryVisible = false
+        menuBarSummaryVisible = false
+      } else if steps[backIdx] == .cursor {
+        cursorSummaryVisible = false
+        menuBarSummaryVisible = false
+      } else if steps[backIdx] == .menuBar {
+        menuBarSummaryVisible = false
       }
       stepCursor = backIdx
     }
 
     while stepCursor < steps.count {
+      let currentStep = steps[stepCursor]
+
+      // If display was preselected via CLI, there is no explicit `.display` step.
+      // Ensure the display summary exists before showing nested cursor/menu choices.
+      if (currentStep == .cursor || currentStep == .menuBar) && !displaySummaryVisible {
+        printDisplaySummary(cursor: selectedCursorMode, menuBar: selectedMenuBarMode)
+      }
+
+      // Check if we have moved past the display group (Display/Cursor/MenuBar) and need to collapse the summaries.
+      // This happens when we land on a step that is NOT in the group, but we haven't collapsed yet.
+      // We also check that we actually printed something to collapse.
+      let isDisplayGroup = (currentStep == .display || currentStep == .cursor || currentStep == .menuBar)
+      if !isDisplayCollapsed && !isDisplayGroup && displaySummaryVisible {
+        if isTTYOut {
+          // Clear sub-option lines (bottom-up).
+          if menuBarSummaryVisible { clearLinesIfTTY(1) }
+          if cursorSummaryVisible { clearLinesIfTTY(1) }
+
+          // Overwrite the Display line with the consolidated description.
+          clearLinesIfTTY(1)
+          printDisplaySummary(cursor: selectedCursorMode, menuBar: selectedMenuBarMode)
+        }
+        cursorSummaryVisible = false
+        menuBarSummaryVisible = false
+        isDisplayCollapsed = true
+      }
+
       let allowBack = previousRewindableStepIndex(from: stepCursor) != nil
       switch steps[stepCursor] {
       case .projectName:
@@ -575,16 +701,10 @@ struct Capa: AsyncParsableCommand {
       case .display:
         if isSingleDisplay {
           selectedDisplayIndex = 0
-          if !singleDisplayLinePrinted {
-            let d = content.displays[0]
-            let filter = SCContentFilter(display: d, excludingWindows: [])
-            let geometry = captureGeometry(
-              filter: filter,
-              fallbackLogicalSize: (Int(d.width), Int(d.height))
-            )
-            print(renderWizardSummary(label: "Display", value: "\(geometry.pixelWidth)x\(geometry.pixelHeight)px", isTTY: isTTYOut))
-            singleDisplayLinePrinted = true
+          if !displaySummaryVisible {
+            printDisplaySummary(cursor: selectedCursorMode, menuBar: selectedMenuBarMode)
           }
+          isDisplayCollapsed = false
           stepCursor += 1
         } else {
           let displayOptions = content.displays.map(displayLabel)
@@ -598,6 +718,10 @@ struct Capa: AsyncParsableCommand {
           case .selected(let idx):
             displayDefaultIndex = idx
             selectedDisplayIndex = idx
+            displaySummaryVisible = true
+            isDisplayCollapsed = false
+            cursorSummaryVisible = false
+            menuBarSummaryVisible = false
             stepCursor += 1
           case .back:
             if let backIdx = previousRewindableStepIndex(from: stepCursor) {
@@ -607,6 +731,56 @@ struct Capa: AsyncParsableCommand {
             print("Canceled.")
             return
           }
+        }
+
+      case .cursor:
+        let result = selectOptionWithBack(
+          title: "Show Cursor",
+          summaryLabel: "Cursor",
+          options: ["Yes", "No"],
+          defaultIndex: cursorDefaultIndex,
+          allowBack: allowBack,
+          summaryIndent: 2
+        )
+        switch result {
+        case .selected(let idx):
+          cursorDefaultIndex = idx
+          selectedCursorMode = (idx == 0) ? .on : .off
+          cursorSummaryVisible = true
+          isDisplayCollapsed = false
+          stepCursor += 1
+        case .back:
+          if let backIdx = previousRewindableStepIndex(from: stepCursor) {
+            rewind(to: backIdx)
+          }
+        case .cancel:
+          print("Canceled.")
+          return
+        }
+
+      case .menuBar:
+        let result = selectOptionWithBack(
+          title: "Show Menu Bar",
+          summaryLabel: "Menu Bar",
+          options: ["Yes", "No"],
+          defaultIndex: menuBarDefaultIndex,
+          allowBack: allowBack,
+          summaryIndent: 2
+        )
+        switch result {
+        case .selected(let idx):
+          menuBarDefaultIndex = idx
+          selectedMenuBarMode = (idx == 0) ? .on : .off
+          menuBarSummaryVisible = true
+          isDisplayCollapsed = false
+          stepCursor += 1
+        case .back:
+          if let backIdx = previousRewindableStepIndex(from: stepCursor) {
+            rewind(to: backIdx)
+          }
+        case .cancel:
+          print("Canceled.")
+          return
         }
 
       case .audio:
@@ -749,6 +923,7 @@ struct Capa: AsyncParsableCommand {
 
     let display = content.displays[selectedDisplayIndex]
     let filter = SCContentFilter(display: display, excludingWindows: [])
+    filter.includeMenuBar = selectedMenuBarMode?.enabled ?? true
     let logicalWidth = Int(display.width)
     let logicalHeight = Int(display.height)
     let geometry = captureGeometry(filter: filter, fallbackLogicalSize: (logicalWidth, logicalHeight))
@@ -864,6 +1039,7 @@ struct Capa: AsyncParsableCommand {
       includeSystemAudio: audioRouting.includeSystemAudio,
       width: geometry.pixelWidth,
       height: geometry.pixelHeight,
+      showsCursor: selectedCursorMode?.enabled ?? true,
       includeCamera: includeCamera,
       cameraDeviceID: cameraDevice?.uniqueID,
       cameraOutputURL: cameraOutFile,
