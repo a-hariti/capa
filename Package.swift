@@ -20,7 +20,8 @@ let package = Package(
       ],
       path: "Sources",
       swiftSettings: [
-        .unsafeFlags(["-enable-testing"], .when(configuration: .debug))
+        .unsafeFlags(["-enable-testing"], .when(configuration: .debug)),
+        .unsafeFlags(["-Xfrontend", "-lazy-typecheck"], .when(configuration: .debug))
       ]
     ),
     .testTarget(

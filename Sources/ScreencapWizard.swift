@@ -4,151 +4,6 @@ import Foundation
 @preconcurrency import ScreenCaptureKit
 import Darwin
 
-enum OnOffMode: String, ExpressibleByArgument, Sendable {
-  case on
-  case off
-
-  var enabled: Bool { self == .on }
-}
-
-struct AudioRouting: Equatable, Sendable {
-  var includeMicrophone: Bool
-  var includeSystemAudio: Bool
-
-  static let none = AudioRouting(includeMicrophone: false, includeSystemAudio: false)
-  static let mic = AudioRouting(includeMicrophone: true, includeSystemAudio: false)
-  static let system = AudioRouting(includeMicrophone: false, includeSystemAudio: true)
-  static let micAndSystem = AudioRouting(includeMicrophone: true, includeSystemAudio: true)
-
-  static func parse(_ raw: String) throws -> AudioRouting {
-    let normalized = raw.lowercased().replacingOccurrences(of: " ", with: "")
-    if normalized.isEmpty {
-      throw ValidationError("Invalid --audio value: empty")
-    }
-    if normalized == "none" {
-      return .none
-    }
-
-    var includeMicrophone = false
-    var includeSystemAudio = false
-    var sawToken = false
-
-    for tokenSub in normalized.split(separator: "+", omittingEmptySubsequences: true) {
-      let token = String(tokenSub)
-      sawToken = true
-      switch token {
-      case "mic", "microphone":
-        includeMicrophone = true
-      case "sys", "system":
-        includeSystemAudio = true
-      default:
-        throw ValidationError("Invalid --audio token '\(token)'. Use only: none, mic, system, mic+system")
-      }
-    }
-
-    if !sawToken {
-      throw ValidationError("Invalid --audio value: '\(raw)'")
-    }
-    return AudioRouting(includeMicrophone: includeMicrophone, includeSystemAudio: includeSystemAudio)
-  }
-}
-
-enum CameraSelection: Sendable {
-  case index(Int)
-  case id(String)
-}
-
-enum DisplaySelection: Sendable {
-  case index(Int)
-  case id(UInt32)
-}
-
-enum FPSSelection: Sendable {
-  case cfr(Int)
-  case vfr
-}
-
-enum MicrophoneSelection: Sendable {
-  case index(Int)
-  case id(String)
-}
-
-private func readTranscodeSkipKey(timeoutMs: Int32) -> Bool {
-  var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
-  let ready = poll(&fds, 1, timeoutMs)
-  guard ready > 0, (fds.revents & Int16(POLLIN)) != 0 else { return false }
-
-  var b: UInt8 = 0
-  guard read(STDIN_FILENO, &b, 1) == 1 else { return false }
-  if b == 0x03 { return true } // Ctrl+C
-  guard b == 0x1b else { return false }
-
-  // Bare Escape skips transcoding. Escape-prefixed key sequences (e.g. arrows) should not.
-  var nextFDs = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
-  let hasFollowup = poll(&nextFDs, 1, 0) > 0 && (nextFDs.revents & Int16(POLLIN)) != 0
-  guard hasFollowup else { return true }
-
-  var discard: UInt8 = 0
-  _ = read(STDIN_FILENO, &discard, 1)
-  while true {
-    var pendingFDs = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
-    let pending = poll(&pendingFDs, 1, 0)
-    if pending <= 0 || (pendingFDs.revents & Int16(POLLIN)) == 0 { break }
-    _ = read(STDIN_FILENO, &discard, 1)
-  }
-  return false
-}
-
-func parseDisplaySelection(_ raw: String) throws -> DisplaySelection {
-  let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-  if value.isEmpty {
-    throw ValidationError("Invalid --display value: empty")
-  }
-  if let index = Int(value) {
-    return .index(index)
-  }
-  if let id = UInt32(value) {
-    return .id(id)
-  }
-  throw ValidationError("Invalid --display value '\(raw)'; expected an index or displayID")
-}
-
-func parseCameraSelection(_ raw: String) throws -> CameraSelection {
-  let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-  if value.isEmpty {
-    throw ValidationError("Invalid --camera value: empty")
-  }
-  if let index = Int(value) {
-    return .index(index)
-  }
-  return .id(value)
-}
-
-func parseMicrophoneSelection(_ raw: String) throws -> MicrophoneSelection {
-  let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-  if value.isEmpty {
-    throw ValidationError("Invalid --mic value: empty")
-  }
-  if let index = Int(value) {
-    return .index(index)
-  }
-  return .id(value)
-}
-
-func parseFPSSelection(_ raw: String) throws -> FPSSelection {
-  let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-  if value.isEmpty {
-    throw ValidationError("Invalid --fps value: empty")
-  }
-  if value == "vfr" {
-    return .vfr
-  }
-  guard let fps = Int(value) else {
-    throw ValidationError("Invalid --fps value '\(raw)'; expected an integer or 'vfr'")
-  }
-  return .cfr(fps)
-}
-
 @main
 struct Capa: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
@@ -162,7 +17,7 @@ struct Capa: AsyncParsableCommand {
   var projectName: String?
 
   @Option(name: .customLong("display"), help: "Select display by index (from --list-displays) or displayID")
-  var displaySelector: String?
+  var displaySelection: DisplaySelection?
 
   @Option(name: .customLong("cursor"), help: "Show cursor: on|off")
   var cursorMode: OnOffMode?
@@ -171,16 +26,16 @@ struct Capa: AsyncParsableCommand {
   var menuBarMode: OnOffMode?
 
   @Option(name: .customLong("audio"), help: "Audio sources: (none, mic, system, mic+system)")
-  var audioSpec: String?
+  var audioRouting: AudioRouting?
 
   @Option(name: .customLong("mic"), help: "Select microphone by index (from --list-mics) or AVCaptureDevice.uniqueID")
-  var microphoneSelector: String?
+  var microphoneSelection: MicrophoneSelection?
 
   @Option(name: .customLong("camera"), help: "Record camera by index (from --list-cameras) or AVCaptureDevice.uniqueID")
-  var cameraSelector: String?
+  var cameraSelection: CameraSelection?
 
   @Option(name: .customLong("fps"), help: "Screen timing mode: integer CFR fps or 'vfr' (default: 60)")
-  var fpsSelector: String?
+  var fpsSelection: FPSSelection?
 
   @Option(name: .customLong("codec"), help: "Video codec (h264|hevc)")
   var codecString: String?
@@ -210,21 +65,18 @@ struct Capa: AsyncParsableCommand {
   var verbose = false
 
   mutating func validate() throws {
-    if let displaySelector {
-      let parsed = try parseDisplaySelection(displaySelector)
-      if case .index(let displayIndex) = parsed, displayIndex < 0 {
+    if let displaySelection {
+      if case .index(let displayIndex) = displaySelection, displayIndex < 0 {
         throw ValidationError("--display must be >= 0 when using an index")
       }
     }
-    if let microphoneSelector {
-      let parsed = try parseMicrophoneSelection(microphoneSelector)
-      if case .index(let microphoneIndex) = parsed, microphoneIndex < 0 {
+    if let microphoneSelection {
+      if case .index(let microphoneIndex) = microphoneSelection, microphoneIndex < 0 {
         throw ValidationError("--mic must be >= 0 when using an index")
       }
     }
-    if let cameraSelector {
-      let parsed = try parseCameraSelection(cameraSelector)
-      if case .index(let cameraIndex) = parsed, cameraIndex < 0 {
+    if let cameraSelection {
+      if case .index(let cameraIndex) = cameraSelection, cameraIndex < 0 {
         throw ValidationError("--camera must be >= 0 when using an index")
       }
     }
@@ -234,19 +86,17 @@ struct Capa: AsyncParsableCommand {
     if let codecString, parseCodec(codecString) == nil {
       throw ValidationError("Invalid --codec: \(codecString) (expected: h264|hevc)")
     }
-    if let fpsSelector {
-      let parsed = try parseFPSSelection(fpsSelector)
-      if case .cfr(let fps) = parsed, fps < 1 {
+    if let fpsSelection {
+      if case .cfr(let fps) = fpsSelection, fps < 1 {
         throw ValidationError("--fps must be >= 1 when using an integer")
       }
     }
     if let projectName, projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       throw ValidationError("--project-name must not be empty")
     }
-    if let audioSpec {
-      let parsed = try AudioRouting.parse(audioSpec)
-      if !parsed.includeMicrophone, microphoneSelector != nil {
-        throw ValidationError("--audio \(audioSpec) does not include microphone; remove --mic or include mic")
+    if let routing = audioRouting {
+      if !routing.includeMicrophone, microphoneSelection != nil {
+        throw ValidationError("--audio does not include microphone; remove --mic or include mic")
       }
     }
   }
@@ -259,41 +109,6 @@ struct Capa: AsyncParsableCommand {
       : "Capa (native macOS screen capture)"
     print(banner)
     print("")
-    func sectionTitle(_ s: String) -> String { isTTYOut ? TUITheme.title(s) : s }
-    func muted(_ s: String) -> String { isTTYOut ? TUITheme.muted(s) : s }
-    func optionText(_ s: String) -> String { isTTYOut ? TUITheme.option(s) : s }
-    func sanitizeProjectName(_ s: String) -> String {
-      let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-      if trimmed.isEmpty { return "capa" }
-      let forbidden = CharacterSet(charactersIn: "/:\\")
-      let mapped = trimmed.unicodeScalars.map { forbidden.contains($0) ? "-" : Character($0) }
-      return String(mapped)
-    }
-    func slugifyFilenameStem(_ s: String) -> String {
-      let lower = s.lowercased()
-      let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-      var out = ""
-      var prevDash = false
-      for sc in lower.unicodeScalars {
-        if allowed.contains(sc) {
-          out.unicodeScalars.append(sc)
-          prevDash = false
-        } else if !prevDash {
-          out.append("-")
-          prevDash = true
-        }
-      }
-      let trimmed = out.trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
-      return trimmed.isEmpty ? "camera" : trimmed
-    }
-    func abbreviateHomePath(_ p: String) -> String {
-      let home = NSHomeDirectory()
-      if p == home { return "~" }
-      if p.hasPrefix(home + "/") {
-        return "~" + String(p.dropFirst(home.count))
-      }
-      return p
-    }
 
     if listMicrophones {
       let audioDevices = AVCaptureDevice.DiscoverySession(
@@ -377,20 +192,12 @@ struct Capa: AsyncParsableCommand {
       case camera
       case codec
     }
-    func clearPreviousAnswerLineIfTTY() {
-      guard isTTYOut else { return }
-      print("\u{001B}[1A\u{001B}[2K\r", terminator: "")
-    }
-    func clearLinesIfTTY(_ count: Int) {
-      guard count > 0 else { return }
-      for _ in 0..<count { clearPreviousAnswerLineIfTTY() }
-    }
 
     var selectedDisplayIndex: Int?
     var selectedProjectName = projectName?.trimmingCharacters(in: .whitespacesAndNewlines)
     var selectedCursorMode: OnOffMode? = cursorMode
     var selectedMenuBarMode: OnOffMode? = menuBarMode
-    var audioRouting: AudioRouting?
+    var audioRouting: AudioRouting? = self.audioRouting
     var audioDevice: AVCaptureDevice?
     var includeMic = false
     var cameraDevice: AVCaptureDevice?
@@ -405,39 +212,13 @@ struct Capa: AsyncParsableCommand {
     var cameraDefaultIndex = 0
     var codecDefaultIndex = 0
 
-    func displayConfigurationDescription(geometry: CaptureGeometry, cursor: OnOffMode?, menuBar: OnOffMode?) -> String {
-      let base = "\(geometry.pixelWidth)x\(geometry.pixelHeight)px"
-      let c = cursor?.enabled ?? true
-      let m = menuBar?.enabled ?? true
-
-      if c && m {
-        // Only show "(full)" if at least one option was explicitly set (CLI or interactive choice),
-        // distinguishing it from the "clean start" state where everything is default/unknown.
-        if cursor == nil && menuBar == nil {
-          return base
-        }
-        return "\(base) (full)"
-      }
-      if !c && !m {
-        return "\(base) (no cursor & menu bar)"
-      }
-      if !c {
-        return "\(base) (no cursor)"
-      }
-      // !m
-      return "\(base) (no menu bar)"
-    }
-
-    let parsedDisplaySelection = try displaySelector.map(parseDisplaySelection)
-
-    if let parsedDisplaySelection {
-      switch parsedDisplaySelection {
+    if let selection = displaySelection {
+      switch selection {
       case .index(let idx):
         if idx >= 0 && idx < content.displays.count {
           selectedDisplayIndex = idx
           displayDefaultIndex = idx
         } else if let id = UInt32(exactly: idx), let resolvedIndex = content.displays.firstIndex(where: { $0.displayID == id }) {
-          // Numeric displayIDs can look like integers; fall back to ID resolution before failing.
           selectedDisplayIndex = resolvedIndex
           displayDefaultIndex = resolvedIndex
         } else {
@@ -460,9 +241,7 @@ struct Capa: AsyncParsableCommand {
       return
     }
 
-    if let audioSpec {
-      audioRouting = try AudioRouting.parse(audioSpec)
-    } else if nonInteractive {
+    if nonInteractive && audioRouting == nil {
       audioRouting = AudioRouting.none
     }
 
@@ -470,13 +249,11 @@ struct Capa: AsyncParsableCommand {
       includeMic = routing.includeMicrophone
     }
 
-    let parsedMicrophoneSelection = try microphoneSelector.map(parseMicrophoneSelection)
-
     if !includeMic {
       includeMic = false
       audioDevice = nil
-    } else if let parsedMicrophoneSelection {
-      switch parsedMicrophoneSelection {
+    } else if let selection = microphoneSelection {
+      switch selection {
       case .index(let idx):
         guard idx >= 0 && idx < audioDevices.count else {
           print("Error: --mic index out of range (0...\(max(0, audioDevices.count - 1)))")
@@ -504,11 +281,9 @@ struct Capa: AsyncParsableCommand {
       audioDevice = nil
     }
 
-    let parsedCameraSelection = try cameraSelector.map(parseCameraSelection)
-
-    if let parsedCameraSelection {
+    if let selection = cameraSelection {
       includeCamera = true
-      switch parsedCameraSelection {
+      switch selection {
       case .index(let idx):
         guard idx >= 0 && idx < videoDevices.count else {
           print("Error: --camera index out of range (0...\(max(0, videoDevices.count - 1)))")
@@ -537,14 +312,14 @@ struct Capa: AsyncParsableCommand {
     if !nonInteractive && selectedProjectName == nil {
       steps.append(.projectName)
     }
-    if parsedDisplaySelection == nil && !nonInteractive { steps.append(.display) }
+    if displaySelection == nil && !nonInteractive { steps.append(.display) }
     if selectedCursorMode == nil && !nonInteractive { steps.append(.cursor) }
     if selectedMenuBarMode == nil && !nonInteractive { steps.append(.menuBar) }
     if audioRouting == nil { steps.append(.audio) }
-    if parsedMicrophoneSelection == nil && !nonInteractive && !audioDevices.isEmpty {
+    if microphoneSelection == nil && !nonInteractive && !audioDevices.isEmpty {
       steps.append(.microphone)
     }
-    if parsedCameraSelection == nil && !nonInteractive && !videoDevices.isEmpty {
+    if cameraSelection == nil && !nonInteractive && !videoDevices.isEmpty {
       steps.append(.camera)
     }
     if codec == nil { steps.append(.codec) }
@@ -578,34 +353,13 @@ struct Capa: AsyncParsableCommand {
     var menuBarSummaryVisible = false
     var stepCursor = 0
 
-    func selectedDisplayGeometry() -> CaptureGeometry? {
-      guard let idx = selectedDisplayIndex else { return nil }
-      let d = content.displays[idx]
-      let f = SCContentFilter(display: d, excludingWindows: [])
-      return captureGeometry(filter: f, fallbackLogicalSize: (Int(d.width), Int(d.height)))
-    }
-
-    func printDisplaySummary(cursor: OnOffMode?, menuBar: OnOffMode?) {
-      guard let geometry = selectedDisplayGeometry() else { return }
-      let desc = displayConfigurationDescription(geometry: geometry, cursor: cursor, menuBar: menuBar)
-      print(renderWizardSummary(label: "Display", value: desc, isTTY: isTTYOut))
-      displaySummaryVisible = true
-    }
-
     func rewind(to backIdx: Int) {
-      // Special handling when rewinding into the display group (Cursor/MenuBar) from a later step.
-      // If the display group was collapsed (consolidated into one line), we need to expand it back
-      // so the Cursor/MenuBar steps have their context (the base Display line + previous sub-options).
       if isDisplayCollapsed && (steps[backIdx] == .cursor || steps[backIdx] == .menuBar) {
-        // 1. Clear the consolidated "Display: ... (full)" line.
-        clearLinesIfTTY(1)
-
-        // 2. Restore the base "Display: ...px" line.
-        printDisplaySummary(cursor: nil, menuBar: nil)
+        clearLines(1, isTTY: isTTYOut)
+        _ = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: nil, menuBar: nil, isTTY: isTTYOut)
         cursorSummaryVisible = false
         menuBarSummaryVisible = false
 
-        // 3. If we are backing to MenuBar, restore the Cursor summary if it was previously printed.
         if steps[backIdx] == .menuBar, let selectedCursorMode {
           let val = selectedCursorMode.enabled ? "Yes" : "No"
           print(renderWizardSummary(label: "Cursor", value: val, isTTY: isTTYOut, indent: 2))
@@ -617,10 +371,9 @@ struct Capa: AsyncParsableCommand {
         return
       }
 
-      clearLinesIfTTY(1)
+      clearLines(1, isTTY: isTTYOut)
       if steps[backIdx] == .projectName {
-        // Remove spacer + project summary so the editable line is re-rendered cleanly.
-        clearLinesIfTTY(2)
+        clearLines(2, isTTY: isTTYOut)
         displaySummaryVisible = false
         cursorSummaryVisible = false
         menuBarSummaryVisible = false
@@ -640,25 +393,17 @@ struct Capa: AsyncParsableCommand {
     while stepCursor < steps.count {
       let currentStep = steps[stepCursor]
 
-      // If display was preselected via CLI, there is no explicit `.display` step.
-      // Ensure the display summary exists before showing nested cursor/menu choices.
       if (currentStep == .cursor || currentStep == .menuBar) && !displaySummaryVisible {
-        printDisplaySummary(cursor: selectedCursorMode, menuBar: selectedMenuBarMode)
+        displaySummaryVisible = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: selectedCursorMode, menuBar: selectedMenuBarMode, isTTY: isTTYOut)
       }
 
-      // Check if we have moved past the display group (Display/Cursor/MenuBar) and need to collapse the summaries.
-      // This happens when we land on a step that is NOT in the group, but we haven't collapsed yet.
-      // We also check that we actually printed something to collapse.
       let isDisplayGroup = (currentStep == .display || currentStep == .cursor || currentStep == .menuBar)
       if !isDisplayCollapsed && !isDisplayGroup && displaySummaryVisible {
         if isTTYOut {
-          // Clear sub-option lines (bottom-up).
-          if menuBarSummaryVisible { clearLinesIfTTY(1) }
-          if cursorSummaryVisible { clearLinesIfTTY(1) }
-
-          // Overwrite the Display line with the consolidated description.
-          clearLinesIfTTY(1)
-          printDisplaySummary(cursor: selectedCursorMode, menuBar: selectedMenuBarMode)
+          if menuBarSummaryVisible { clearLines(1, isTTY: isTTYOut) }
+          if cursorSummaryVisible { clearLines(1, isTTY: isTTYOut) }
+          clearLines(1, isTTY: isTTYOut)
+          _ = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: selectedCursorMode, menuBar: selectedMenuBarMode, isTTY: isTTYOut)
         }
         cursorSummaryVisible = false
         menuBarSummaryVisible = false
@@ -666,15 +411,12 @@ struct Capa: AsyncParsableCommand {
       }
 
       let allowBack = previousRewindableStepIndex(from: stepCursor) != nil
-      switch steps[stepCursor] {
+      switch currentStep {
       case .projectName:
-        switch promptEditableDefault(terminal: terminal, title: "Project Name", defaultValue: defaultProjectName) {
-        case .submitted(let value):
-          selectedProjectName = sanitizeProjectName(value)
-          print("")
+        if let next = try await handleProjectNameStep(terminal: terminal, defaultProjectName: defaultProjectName) {
+          selectedProjectName = next
           stepCursor += 1
-        case .cancel:
-          print("Canceled.")
+        } else {
           return
         }
 
@@ -682,16 +424,15 @@ struct Capa: AsyncParsableCommand {
         if isSingleDisplay {
           selectedDisplayIndex = 0
           if !displaySummaryVisible {
-            printDisplaySummary(cursor: selectedCursorMode, menuBar: selectedMenuBarMode)
+            displaySummaryVisible = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: selectedCursorMode, menuBar: selectedMenuBarMode, isTTY: isTTYOut)
           }
           isDisplayCollapsed = false
           stepCursor += 1
         } else {
-          let displayOptions = content.displays.map(displayLabel)
           let result = selectOptionWithBack(
             terminal: terminal,
             title: "Display",
-            options: displayOptions,
+            options: content.displays.map(displayLabel),
             defaultIndex: displayDefaultIndex,
             allowBack: allowBack
           )
@@ -811,12 +552,11 @@ struct Capa: AsyncParsableCommand {
           stepCursor += 1
           continue
         }
-        let options = audioDevices.map(microphoneLabel)
         let result = selectOptionWithBack(
           terminal: terminal,
           title: "Microphone",
-          options: options,
-          defaultIndex: min(microphoneDefaultIndex, max(0, options.count - 1)),
+          options: audioDevices.map(microphoneLabel),
+          defaultIndex: min(microphoneDefaultIndex, max(0, audioDevices.count - 1)),
           allowBack: allowBack
         )
         switch result {
@@ -864,11 +604,10 @@ struct Capa: AsyncParsableCommand {
         }
 
       case .codec:
-        let codecOptions = ["H.264", "H.265/HEVC"]
         let result = selectOptionWithBack(
           terminal: terminal,
           title: "Video Codec",
-          options: codecOptions,
+          options: ["H.264", "H.265/HEVC"],
           defaultIndex: codecDefaultIndex,
           allowBack: allowBack
         )
@@ -936,16 +675,14 @@ struct Capa: AsyncParsableCommand {
     }
 
     let cfrFPS: Int?
-    let parsedFPSSelection = try fpsSelector.map(parseFPSSelection)
-    if let parsedFPSSelection {
-      switch parsedFPSSelection {
+    if let selection = fpsSelection {
+      switch selection {
       case .vfr:
         cfrFPS = nil
       case .cfr(let fps):
         cfrFPS = max(1, min(240, fps))
       }
     } else {
-      // Default to CFR 60; users can opt in to VFR with `--fps vfr`.
       cfrFPS = 60
     }
     let timecodeSync: TimecodeSyncContext? = includeCamera ? TimecodeSyncContext(fps: cfrFPS ?? 60) : nil
@@ -957,54 +694,20 @@ struct Capa: AsyncParsableCommand {
 
     var finalProjectName = projectName
 
-    func directoryExists(_ url: URL) -> Bool {
-      var isDir: ObjCBool = false
-      return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
-    }
-    func directoryNonEmpty(_ url: URL) -> Bool {
-      guard directoryExists(url) else { return false }
-      let contents = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
-      return !contents.isEmpty
-    }
-    func fileExists(_ url: URL) -> Bool {
-      FileManager.default.fileExists(atPath: url.path)
-    }
-    func ensureUniqueProjectDir(parent: URL, name: String, expectedFilenames: [String]) -> (name: String, dir: URL) {
-      func conflicts(dir: URL) -> Bool {
-        for f in expectedFilenames {
-          if fileExists(dir.appendingPathComponent(f)) { return true }
-        }
-        return directoryNonEmpty(dir)
-      }
-
-      var candidateName = name
-      var candidateDir = parent.appendingPathComponent(candidateName, isDirectory: true)
-      if !conflicts(dir: candidateDir) { return (candidateName, candidateDir) }
-
-      var i = 2
-      while i < 10_000 {
-        candidateName = "\(name)-\(i)"
-        candidateDir = parent.appendingPathComponent(candidateName, isDirectory: true)
-        if !conflicts(dir: candidateDir) { return (candidateName, candidateDir) }
-        i += 1
-      }
-      return (name, parent.appendingPathComponent(name, isDirectory: true))
-    }
-
     let outFile: URL
     let cameraOutFile: URL?
     let cameraFilename: String? = {
       guard includeCamera else { return nil }
-      if let cameraDevice { return "\(slugifyFilenameStem(cameraDevice.localizedName)).mov" }
+      if let cameraDevice { return "\(Utils.slugifyFilenameStem(cameraDevice.localizedName)).mov" }
       return "camera.mov"
     }()
     let expected = ["screen.mov"] + (cameraFilename.map { [$0] } ?? [])
-    let (uniqueName, projectDir) = ensureUniqueProjectDir(parent: recsDir, name: finalProjectName, expectedFilenames: expected)
+    let (uniqueName, projectDir) = Utils.ensureUniqueProjectDir(parent: recsDir, name: finalProjectName, expectedFilenames: expected)
     finalProjectName = uniqueName
     try? FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
     outFile = projectDir.appendingPathComponent("screen.mov")
     if includeCamera, let cameraDevice {
-      cameraOutFile = projectDir.appendingPathComponent("\(slugifyFilenameStem(cameraDevice.localizedName)).mov")
+      cameraOutFile = projectDir.appendingPathComponent("\(Utils.slugifyFilenameStem(cameraDevice.localizedName)).mov")
     } else {
       cameraOutFile = includeCamera ? projectDir.appendingPathComponent("camera.mov") : nil
     }
@@ -1038,28 +741,28 @@ struct Capa: AsyncParsableCommand {
     let codecName = (codec == .hevc) ? "H.265/HEVC" : "H.264"
     if verbose {
       print("")
-      print(sectionTitle("Settings:"))
-      print(muted("  Capture: \(Int(geometry.sourceRect.width))x\(Int(geometry.sourceRect.height)) pt @ \(scaleStr)x => \(geometry.pixelWidth)x\(geometry.pixelHeight) px"))
-      print(muted("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh"))
+      print(sectionTitle("Settings:", isTTY: isTTYOut))
+      print(muted("  Capture: \(Int(geometry.sourceRect.width))x\(Int(geometry.sourceRect.height)) pt @ \(scaleStr)x => \(geometry.pixelWidth)x\(geometry.pixelHeight) px", isTTY: isTTYOut))
+      print(muted("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh", isTTY: isTTYOut))
       if cfrFPS == nil {
-        print(muted("  Screen timing: VFR"))
+        print(muted("  Screen timing: VFR", isTTY: isTTYOut))
       } else {
-        print(muted("  Screen timing: CFR \(cfrFPS ?? 60) fps"))
+        print(muted("  Screen timing: CFR \(cfrFPS ?? 60) fps", isTTY: isTTYOut))
       }
       if includeCamera {
-        print(muted("  Camera timing: native (no CFR)"))
+        print(muted("  Camera timing: native (no CFR)", isTTY: isTTYOut))
       }
       if includeMic, let audioDevice {
-        print(muted("  Microphone: \(audioDevice.localizedName)"))
+        print(muted("  Microphone: \(audioDevice.localizedName)", isTTY: isTTYOut))
       } else {
-        print(muted("  Microphone: none"))
+        print(muted("  Microphone: none", isTTY: isTTYOut))
       }
       if includeCamera, let cameraDevice {
-        print(muted("  Camera: \(cameraDevice.localizedName)"))
+        print(muted("  Camera: \(cameraDevice.localizedName)", isTTY: isTTYOut))
       } else {
-        print(muted("  Camera: none"))
+        print(muted("  Camera: none", isTTY: isTTYOut))
       }
-      print(muted("  System audio: \(audioRouting.includeSystemAudio ? "on" : "off")"))
+      print(muted("  System audio: \(audioRouting.includeSystemAudio ? "on" : "off")", isTTY: isTTYOut))
       print("")
     }
     let canReadKeys = TerminalController.isTTY(STDIN_FILENO)
@@ -1075,7 +778,6 @@ struct Capa: AsyncParsableCommand {
     let stopStream = AsyncStream<Void> { continuation in
       let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
 
-      // Key listener.
       let keyTask: Task<Void, Never>?
       if canReadKeys {
         keyTask = Task.detached {
@@ -1096,12 +798,10 @@ struct Capa: AsyncParsableCommand {
         keyTask = nil
       }
 
-      // SIGINT listener.
       signal(SIGINT, SIG_IGN)
       sigintSource.setEventHandler { continuation.yield() }
       sigintSource.resume()
 
-      // Auto-stop.
       let duration = durationSeconds
         ?? (ProcessInfo.processInfo.environment["SCREENCAP_AUTOSTOP_SECONDS"].flatMap { Int($0) })
       let autoStopTask: Task<Void, Never>?
@@ -1175,8 +875,6 @@ struct Capa: AsyncParsableCommand {
 
     if includeCamera, let cameraOutFile {
       do {
-        // Ensure the camera file has its own audio first, and the screen's "Master (Mixed)" as a secondary
-        // alignment reference (perfect sync for multi-cam editing).
         try await AlignmentMux.addMasterAlignmentTrack(cameraURL: cameraOutFile, screenURL: outFile)
       } catch {
         print("Warning: failed to add alignment track to camera recording: \(error)")
@@ -1216,7 +914,7 @@ struct Capa: AsyncParsableCommand {
           let finished = transcodeFinished.get()
           let skipped = skipTranscode.get()
           if finished || skipped { break }
-          if readTranscodeSkipKey(timeoutMs: 80) {
+          if Utils.readTranscodeSkipKey(timeoutMs: 80) {
             skipTranscode.set()
             break
           }
@@ -1239,12 +937,12 @@ struct Capa: AsyncParsableCommand {
       print("")
     }
     if let cameraOutFile {
-      print(sectionTitle("Files:"))
-      print("\(isTTYOut ? TUITheme.label("  Screen:") : "  Screen:") \(abbreviateHomePath(outFile.path))")
-      print("\(isTTYOut ? TUITheme.label("  Camera:") : "  Camera:") \(abbreviateHomePath(cameraOutFile.path))")
+      print(sectionTitle("Files:", isTTY: isTTYOut))
+      print("\(isTTYOut ? TUITheme.label("  Screen:") : "  Screen:") \(Utils.abbreviateHomePath(outFile.path))")
+      print("\(isTTYOut ? TUITheme.label("  Camera:") : "  Camera:") \(Utils.abbreviateHomePath(cameraOutFile.path))")
     } else {
       let savedLabel = isTTYOut ? TUITheme.label("Saved to:") : "Saved to:"
-      print("\(savedLabel) \(abbreviateHomePath(outFile.path))")
+      print("\(savedLabel) \(Utils.abbreviateHomePath(outFile.path))")
     }
 
     if verbose, audioRouting.includeSystemAudio || includeMic {
@@ -1253,14 +951,13 @@ struct Capa: AsyncParsableCommand {
       if screenHasMaster { parts.append("qaa=Master (mixed)") }
       if includeMic { parts.append("qac=Mic") }
       if audioRouting.includeSystemAudio { parts.append("qab=System") }
-      print(muted("  Audio tracks (language tags): " + parts.joined(separator: ", ")))
+      print(muted("  Audio tracks (language tags): " + parts.joined(separator: ", "), isTTY: isTTYOut))
     }
     if verbose, includeCamera, cameraOutFile != nil {
-      print(muted("  Video files: screen=\(outFile.lastPathComponent), camera=\(cameraOutFile!.lastPathComponent)"))
-      print(muted("  Camera file audio: a0=Mic (if enabled), a1=Master (mixed, for alignment)"))
+      print(muted("  Video files: screen=\(outFile.lastPathComponent), camera=\(cameraOutFile!.lastPathComponent)", isTTY: isTTYOut))
+      print(muted("  Camera file audio: a0=Mic (if enabled), a1=Master (mixed, for alignment)", isTTY: isTTYOut))
     }
     print("")
-    // CLI-driven default: open unless explicitly disabled.
     let shouldOpen = !noOpenFlag
 
     if shouldOpen {
@@ -1270,15 +967,64 @@ struct Capa: AsyncParsableCommand {
       try? p.run()
     }
   }
-}
 
-private func parseCodec(_ s: String) -> AVVideoCodecType? {
-  switch s.lowercased() {
-  case "h264", "avc", "avc1":
-    return .h264
-  case "hevc", "h265", "hvc", "hvc1":
-    return .hevc
-  default:
-    return nil
+  private func handleProjectNameStep(terminal: TerminalController, defaultProjectName: String) async throws -> String? {
+    switch promptEditableDefault(terminal: terminal, title: "Project Name", defaultValue: defaultProjectName) {
+    case .submitted(let value):
+      let sanitized = Utils.sanitizeProjectName(value)
+      print("")
+      return sanitized
+    case .cancel:
+      print("Canceled.")
+      return nil
+    }
+  }
+
+  private func sectionTitle(_ s: String, isTTY: Bool) -> String { isTTY ? TUITheme.title(s) : s }
+  private func muted(_ s: String, isTTY: Bool) -> String { isTTY ? TUITheme.muted(s) : s }
+  private func optionText(_ s: String, isTTY: Bool) -> String { isTTY ? TUITheme.option(s) : s }
+
+  private func clearPreviousAnswerLine(isTTY: Bool) {
+    guard isTTY else { return }
+    print("\u{001B}[1A\u{001B}[2K\r", terminator: "")
+  }
+
+  private func clearLines(_ count: Int, isTTY: Bool) {
+    guard count > 0 else { return }
+    for _ in 0..<count { clearPreviousAnswerLine(isTTY: isTTY) }
+  }
+
+  private func displayConfigurationDescription(geometry: CaptureGeometry, cursor: OnOffMode?, menuBar: OnOffMode?) -> String {
+    let base = "\(geometry.pixelWidth)x\(geometry.pixelHeight)px"
+    let c = cursor?.enabled ?? true
+    let m = menuBar?.enabled ?? true
+
+    if c && m {
+      if cursor == nil && menuBar == nil {
+        return base
+      }
+      return "\(base) (full)"
+    }
+    if !c && !m {
+      return "\(base) (no cursor & menu bar)"
+    }
+    if !c {
+      return "\(base) (no cursor)"
+    }
+    return "\(base) (no menu bar)"
+  }
+
+  private func selectedDisplayGeometry(selectedDisplayIndex: Int?, content: SCShareableContent) -> CaptureGeometry? {
+    guard let idx = selectedDisplayIndex else { return nil }
+    let d = content.displays[idx]
+    let f = SCContentFilter(display: d, excludingWindows: [])
+    return captureGeometry(filter: f, fallbackLogicalSize: (Int(d.width), Int(d.height)))
+  }
+
+  private func printDisplaySummary(selectedDisplayIndex: Int?, content: SCShareableContent, cursor: OnOffMode?, menuBar: OnOffMode?, isTTY: Bool) -> Bool {
+    guard let geometry = selectedDisplayGeometry(selectedDisplayIndex: selectedDisplayIndex, content: content) else { return false }
+    let desc = displayConfigurationDescription(geometry: geometry, cursor: cursor, menuBar: menuBar)
+    print(renderWizardSummary(label: "Display", value: desc, isTTY: isTTY))
+    return true
   }
 }

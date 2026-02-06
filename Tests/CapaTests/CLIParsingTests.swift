@@ -1,4 +1,5 @@
 import XCTest
+import ArgumentParser
 @testable import capa
 
 final class CLIParsingTests: XCTestCase {
@@ -7,7 +8,11 @@ final class CLIParsingTests: XCTestCase {
     guard let cmd = parsed as? Capa else {
       return XCTFail("Failed to parse as Capa")
     }
-    XCTAssertEqual(cmd.displaySelector, "2")
+    if case .index(let idx) = cmd.displaySelection {
+      XCTAssertEqual(idx, 2)
+    } else {
+      XCTFail("Expected index(2), got \(String(describing: cmd.displaySelection))")
+    }
   }
 
   func testParseAudioAndFPS() throws {
@@ -15,19 +20,23 @@ final class CLIParsingTests: XCTestCase {
     guard let cmd = parsed as? Capa else {
       return XCTFail("Failed to parse as Capa")
     }
-    XCTAssertEqual(cmd.audioSpec, "system")
-    XCTAssertEqual(cmd.fpsSelector, "30")
+    XCTAssertEqual(cmd.audioRouting, AudioRouting.system)
+    if case .cfr(let fps) = cmd.fpsSelection {
+      XCTAssertEqual(fps, 30)
+    } else {
+      XCTFail("Expected cfr(30), got \(String(describing: cmd.fpsSelection))")
+    }
   }
 
   func testParseAudioFlexibleOrderAndSafeMixOff() throws {
     let parsed = try Capa.parseAsRoot([
-      "--audio", "system+++mic",
+      "--audio", "system+mic",
       "--safe-mix", "off",
     ])
     guard let cmd = parsed as? Capa else {
       return XCTFail("Failed to parse as Capa")
     }
-    XCTAssertEqual(cmd.audioSpec, "system+++mic")
+    XCTAssertEqual(cmd.audioRouting, AudioRouting.micAndSystem)
     XCTAssertEqual(cmd.safeMixMode, .off)
   }
 
@@ -36,7 +45,7 @@ final class CLIParsingTests: XCTestCase {
     guard let cmd = parsed as? Capa else {
       return XCTFail("Failed to parse as Capa")
     }
-    XCTAssertEqual(cmd.audioSpec, "mic")
+    XCTAssertEqual(cmd.audioRouting, AudioRouting.mic)
   }
 
   func testParseVFRMode() throws {
@@ -44,7 +53,11 @@ final class CLIParsingTests: XCTestCase {
     guard let cmd = parsed as? Capa else {
       return XCTFail("Failed to parse as Capa")
     }
-    XCTAssertEqual(cmd.fpsSelector, "vfr")
+    if case .vfr = cmd.fpsSelection {
+      // success
+    } else {
+      XCTFail("Expected vfr, got \(String(describing: cmd.fpsSelection))")
+    }
   }
 
   func testUnknownArgumentThrows() {
