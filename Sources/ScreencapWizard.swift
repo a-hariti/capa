@@ -73,22 +73,6 @@ enum MicrophoneSelection: Sendable {
   case id(String)
 }
 
-actor SharedFlag {
-  private var value: Bool
-
-  init(_ initialValue: Bool = false) {
-    self.value = initialValue
-  }
-
-  func get() -> Bool {
-    return value
-  }
-
-  func set(_ newValue: Bool = true) {
-    value = newValue
-  }
-}
-
 private func readTranscodeSkipKey(timeoutMs: Int32) -> Bool {
   var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
   let ready = poll(&fds, 1, timeoutMs)
@@ -1088,34 +1072,55 @@ struct Capa: AsyncParsableCommand {
       print("Recording...")
     }
 
-    let (stopStream, stopContinuation) = AsyncStream.makeStream(of: Void.self)
+    let stopStream = AsyncStream<Void> { continuation in
+      let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
 
-    // Key listener.
-    if canReadKeys {
-      DispatchQueue.global().async {
-        terminal.enableRawMode()
-        defer { terminal.disableRawMode() }
-        while true {
-          let key = terminal.readKey()
-          if case .char(let c) = key, c == "q" || c == "Q" {
-            stopContinuation.yield()
-            return
+      // Key listener.
+      let keyTask: Task<Void, Never>?
+      if canReadKeys {
+        keyTask = Task.detached {
+          terminal.enableRawMode()
+          defer { terminal.disableRawMode() }
+          for await key in terminal.keys {
+            if case .char(let c) = key, (c == "q" || c == "Q") {
+              continuation.yield()
+              break
+            }
+            if case .ctrlC = key {
+              continuation.yield()
+              break
+            }
           }
         }
+      } else {
+        keyTask = nil
       }
-    }
 
-    // SIGINT listener.
-    signal(SIGINT, SIG_IGN)
-    let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-    sigintSource.setEventHandler { stopContinuation.yield() }
-    sigintSource.resume()
+      // SIGINT listener.
+      signal(SIGINT, SIG_IGN)
+      sigintSource.setEventHandler { continuation.yield() }
+      sigintSource.resume()
 
-    let duration = durationSeconds
-      ?? (ProcessInfo.processInfo.environment["SCREENCAP_AUTOSTOP_SECONDS"].flatMap { Int($0) })
-    if let seconds = duration, seconds > 0 {
-      print("Auto-stop: \(seconds)s")
-      DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(seconds)) { stopContinuation.yield() }
+      // Auto-stop.
+      let duration = durationSeconds
+        ?? (ProcessInfo.processInfo.environment["SCREENCAP_AUTOSTOP_SECONDS"].flatMap { Int($0) })
+      let autoStopTask: Task<Void, Never>?
+      if let seconds = duration, seconds > 0 {
+        print("Auto-stop: \(seconds)s")
+        autoStopTask = Task.detached {
+          try? await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+          continuation.yield()
+        }
+      } else {
+        autoStopTask = nil
+      }
+
+      continuation.onTermination = { _ in
+        keyTask?.cancel()
+        sigintSource.cancel()
+        autoStopTask?.cancel()
+        signal(SIGINT, SIG_DFL)
+      }
     }
 
     var suffix: (@Sendable () -> String)?
@@ -1149,8 +1154,6 @@ struct Capa: AsyncParsableCommand {
       print("Recording failed: \(error)")
       return
     }
-    sigintSource.cancel()
-    signal(SIGINT, SIG_DFL)
 
     do {
       let mixConfig = PostProcess.MixConfig(
@@ -1189,7 +1192,7 @@ struct Capa: AsyncParsableCommand {
       let transcodeFinished = SharedFlag(false)
       signal(SIGINT, SIG_IGN)
       let transcodeSigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
-      transcodeSigintSource.setEventHandler { Task { await skipTranscode.set() } }
+      transcodeSigintSource.setEventHandler { skipTranscode.set() }
       transcodeSigintSource.resume()
       defer {
         transcodeSigintSource.cancel()
@@ -1197,11 +1200,11 @@ struct Capa: AsyncParsableCommand {
       }
 
       let transcodeTask = Task {
-        defer { Task { await transcodeFinished.set() } }
+        defer { transcodeFinished.set() }
         try await VideoCFR.rewriteInPlace(
           url: outFile,
           fps: cfrFPS,
-          shouldCancel: { await skipTranscode.get() },
+          shouldCancel: { skipTranscode.get() },
           cancelHint: "Escape to skip transcoding"
         )
       }
@@ -1210,11 +1213,11 @@ struct Capa: AsyncParsableCommand {
         terminal.enableRawMode(disableSignals: true)
         defer { terminal.disableRawMode() }
         while true {
-          let finished = await transcodeFinished.get()
-          let skipped = await skipTranscode.get()
+          let finished = transcodeFinished.get()
+          let skipped = skipTranscode.get()
           if finished || skipped { break }
           if readTranscodeSkipKey(timeoutMs: 80) {
-            await skipTranscode.set()
+            skipTranscode.set()
             break
           }
         }

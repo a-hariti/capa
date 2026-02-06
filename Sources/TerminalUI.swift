@@ -1,6 +1,27 @@
 import Foundation
 import Darwin
 
+final class SharedFlag: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: Bool
+
+  init(_ initialValue: Bool = false) {
+    self.value = initialValue
+  }
+
+  func get() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
+  }
+
+  func set(_ newValue: Bool = true) {
+    lock.lock()
+    value = newValue
+    lock.unlock()
+  }
+}
+
 private let wizardSummaryLabels = [
   "Project Name",
   "Display",
@@ -86,12 +107,12 @@ final class TerminalController: @unchecked Sendable {
     rawEnabled = false
   }
 
-  func readKey() -> Key {
-    var buffer = [UInt8](repeating: 0, count: 3)
-    let n = read(STDIN_FILENO, &buffer, 1)
-    if n <= 0 { return .unknown }
+  func readKey(timeoutMs: Int32 = -1) -> Key? {
+    guard let firstByte = readByte(timeoutMs: timeoutMs) else {
+      return nil
+    }
 
-    if buffer[0] == 0x1b {
+    if firstByte == 0x1b {
       guard let b1 = readByte(timeoutMs: 20) else {
         return .escape
       }
@@ -102,14 +123,35 @@ final class TerminalController: @unchecked Sendable {
       return .unknown
     }
 
-    if buffer[0] == 0x0a || buffer[0] == 0x0d { return .enter }
-    if buffer[0] == 0x08 || buffer[0] == 0x7f { return .backspace }
-    if buffer[0] == 0x03 { return .ctrlC }
-    if buffer[0] == 0x04 { return .ctrlD }
-    if let c = TerminalController.decodeUTF8Character(startByte: buffer[0], readNextByte: { _ in readByte(timeoutMs: 20) }) {
+    if firstByte == 0x0a || firstByte == 0x0d { return .enter }
+    if firstByte == 0x08 || firstByte == 0x7f { return .backspace }
+    if firstByte == 0x03 { return .ctrlC }
+    if firstByte == 0x04 { return .ctrlD }
+    if let c = TerminalController.decodeUTF8Character(startByte: firstByte, readNextByte: { _ in readByte(timeoutMs: 20) }) {
       return .char(c)
     }
     return .unknown
+  }
+
+  var keys: AsyncStream<Key> {
+    AsyncStream { continuation in
+      let isRunning = SharedFlag(true)
+      continuation.onTermination = { _ in
+        isRunning.set(false)
+      }
+      let t = Thread { [weak self] in
+        guard let self else { return }
+        while isRunning.get() {
+          if let key = self.readKey(timeoutMs: 100) {
+            continuation.yield(key)
+            if case .ctrlC = key { break }
+            if case .ctrlD = key { break }
+          }
+        }
+        continuation.finish()
+      }
+      t.start()
+    }
   }
 
   static func decodeUTF8Character(startByte: UInt8, readNextByte: (_ timeoutMs: Int32) -> UInt8?) -> Character? {
@@ -240,7 +282,8 @@ func selectOptionWithBack(
 
   render()
   while true {
-    switch terminal.readKey() {
+    guard let key = terminal.readKey() else { continue }
+    switch key {
     case .up:
       if index > 0 { index -= 1 }
     case .down:
@@ -314,7 +357,8 @@ func promptEditableDefault(terminal: TerminalController, title: String, defaultV
 
   render()
   while true {
-    switch terminal.readKey() {
+    guard let key = terminal.readKey() else { continue }
+    switch key {
     case .enter:
       print("")
       let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
