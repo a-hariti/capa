@@ -8,6 +8,7 @@ import Darwin
 struct Capa: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     abstract: "Native macOS screen recorder (QuickTime-like output).",
+    usage: "capa <options> or simply run interactively without any flags",
     version: "0.1.0"
   )
 
