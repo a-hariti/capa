@@ -363,7 +363,7 @@ func promptEditableDefault(terminal: TerminalController, title: String, defaultV
       print("")
       let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
       return .submitted(trimmed.isEmpty ? defaultValue : trimmed)
-    case .ctrlC, .ctrlD:
+    case .ctrlC, .ctrlD, .escape:
       print("\r\u{001B}[2K", terminator: "")
       print("")
       return .cancel

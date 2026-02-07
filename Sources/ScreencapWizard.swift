@@ -893,34 +893,78 @@ struct Capa: AsyncParsableCommand {
       }
     }
 
-    var finalCFRFPS = cfrFPS
+    var finalCFRFPS: Int? = cfrFPS
     if finalCFRFPS == nil && !nonInteractive && fpsSelection == nil {
-      print("")
-      let promptTitle = "Post-process to constant fps? " + (isTTYOut ? TUITheme.label("(Better for video editors, might take a while)") : "(Better for video editors, might take a while)")
-      let result = selectOptionWithBack(
-        terminal: terminal,
-        title: promptTitle,
-        options: ["Yes", "No (keep VFR)"],
-        defaultIndex: 0,
-        allowBack: false,
-        printSummary: false
-      )
-      if case .selected(let idx) = result, idx == 0 {
-        let fpsResult = selectOptionWithBack(
-          terminal: terminal,
-          title: "Select Target FPS",
-          options: ["30 fps", "60 fps", "120 fps"],
-          defaultIndex: 1, // Default to 60
-          allowBack: false,
-          printSummary: false
-        )
-        if case .selected(let fpsIdx) = fpsResult {
-          switch fpsIdx {
-          case 0: finalCFRFPS = 30
-          case 1: finalCFRFPS = 60
-          case 2: finalCFRFPS = 120
-          default: finalCFRFPS = 60
+      enum TranscodeStep : Equatable {
+        case ask, selectFPS, customFPS(dirty: Bool), done
+      }
+      var currentStep: TranscodeStep = .ask
+      while currentStep != .done {
+        switch currentStep {
+        case .ask:
+          let hint = "(Better for video editors, might take a while)"
+          let promptTitle = "Post-process to constant fps? " + (isTTYOut ? TUITheme.label(hint) : hint)
+          let result = selectOptionWithBack(terminal: terminal, title: promptTitle, options: ["Yes", "No (keep VFR)"], defaultIndex: 0, allowBack: false, printSummary: false)
+          switch result {
+          case .selected(let idx):
+            if idx == 0 { currentStep = .selectFPS }
+            else { finalCFRFPS = nil; currentStep = .done }
+          case .back: currentStep = .done
+          case .cancel: return
           }
+
+        case .selectFPS:
+          let result = selectOptionWithBack(terminal: terminal, title: "Select Target FPS", options: ["30 fps", "60 fps", "120 fps", "Custom..."], defaultIndex: 1, allowBack: true, printSummary: false)
+          switch result {
+          case .selected(let idx):
+            switch idx {
+            case 0: finalCFRFPS = 30; currentStep = .done
+            case 1: finalCFRFPS = 60; currentStep = .done
+            case 2: finalCFRFPS = 120; currentStep = .done
+            default: currentStep = .customFPS(dirty: false)
+            }
+          case .back:
+            if isTTYOut { clearLines(1, isTTY: isTTYOut) }
+            currentStep = .ask
+          case .cancel: return
+          }
+
+        case .customFPS(let dirty):
+          let result = promptEditableDefault(terminal: terminal, title: "Custom FPS", defaultValue: "60")
+          switch result {
+          case .submitted(let val):
+            let trimmed = val.trimmingCharacters(in: .whitespaces)
+            if let intVal = Int(trimmed) {
+              if intVal <= 0 {
+                if dirty && isTTYOut { clearLines(2, isTTY: isTTYOut) }
+                else if isTTYOut { clearLines(1, isTTY: isTTYOut) }
+                let msg = "Invalid input. Please enter a value greater than 0."
+                print(isTTYOut ? TUITheme.muted(msg) : msg)
+                currentStep = .customFPS(dirty: true)
+              } else {
+                if dirty && isTTYOut { clearLines(2, isTTY: isTTYOut) }
+                let clamped = min(240, intVal)
+                if clamped != intVal {
+                  let msg = "Clamped to \(clamped) fps"
+                  print(isTTYOut ? TUITheme.muted(msg) : msg)
+                }
+                finalCFRFPS = clamped
+                currentStep = .done
+              }
+            } else {
+              if dirty && isTTYOut { clearLines(2, isTTY: isTTYOut) }
+              else if isTTYOut { clearLines(1, isTTY: isTTYOut) }
+              let msg = "Invalid input. Please enter a whole number (24, 60 ...)"
+              print(isTTYOut ? TUITheme.muted(msg) : msg)
+              currentStep = .customFPS(dirty: true)
+            }
+          case .cancel:
+            if dirty && isTTYOut { clearLines(2, isTTY: isTTYOut) }
+            currentStep = .selectFPS
+          }
+
+
+        case .done: break
         }
       }
     }
