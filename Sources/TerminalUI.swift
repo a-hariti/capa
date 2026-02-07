@@ -37,14 +37,11 @@ private let wizardSummaryLabelWidth = wizardSummaryLabels
   .map { Ansi.visibleWidth($0) }
   .max() ?? 0
 
-func renderWizardSummary(label: String, value: String, isTTY: Bool, indent: Int = 0) -> String {
+func renderWizardSummary(label: String, value: String, theme: TUITheme, indent: Int = 0) -> String {
   let pad = max(0, wizardSummaryLabelWidth - Ansi.visibleWidth(label))
   let paddedLabel = label + String(repeating: " ", count: pad)
   let prefix = String(repeating: " ", count: indent)
-  if isTTY {
-    return "\(prefix)\(TUITheme.primary(paddedLabel)) \(TUITheme.label(":")) \(TUITheme.option(value))"
-  }
-  return "\(prefix)\(paddedLabel) : \(value)"
+  return "\(prefix)\(theme.primary(paddedLabel)) \(theme.label(":")) \(theme.option(value))"
 }
 
 func fitTickerLine(base: String, suffix: String?, maxColumns: Int?) -> String {
@@ -246,6 +243,7 @@ func selectOptionWithBack(
   guard TerminalController.isTTY(STDIN_FILENO) else {
     return .selected(min(max(defaultIndex, 0), options.count - 1))
   }
+  let theme = TUITheme(isTTY: true)
   var index = min(max(defaultIndex, 0), options.count - 1)
   let lines = options.count + 2
 
@@ -261,20 +259,20 @@ func selectOptionWithBack(
   }
 
   func render() {
-    print(TUITheme.primary("\(title):"))
+    print(theme.primary("\(title):"))
     for i in 0..<options.count {
       let parts = splitPrimarySecondary(options[i])
-      let secondary = parts.secondary.map { " " + TUITheme.muted($0) } ?? ""
+      let secondary = parts.secondary.map { " " + theme.muted($0) } ?? ""
       if i == index {
-        print("  \(TUITheme.accent(TUITheme.Glyph.pickerCaret, bold: true)) \(Ansi.bold)\(TUITheme.accent(parts.primary, bold: true))\(Ansi.reset)\(secondary)")
+        print("  \(theme.accent(TUITheme.Glyph.pickerCaret, bold: true)) \(Ansi.bold)\(theme.accent(parts.primary, bold: true))\(Ansi.reset)\(secondary)")
       } else {
-        print("    \(TUITheme.option(parts.primary))\(secondary)")
+        print("    \(theme.option(parts.primary))\(secondary)")
       }
     }
     let hint = allowBack
       ? "↑/↓ move\(TUITheme.Glyph.pickerHintSep)Enter select\(TUITheme.Glyph.pickerHintSep)Esc back"
       : "↑/↓ move\(TUITheme.Glyph.pickerHintSep)Enter select"
-    print(TUITheme.muted(hint))
+    print(theme.muted(hint))
   }
 
   terminal.enableRawMode(disableSignals: true)
@@ -300,7 +298,7 @@ func selectOptionWithBack(
       print("\u{001B}[\(lines - 1)A", terminator: "")
       if printSummary {
         let picked = splitPrimarySecondary(options[index]).primary
-        print(renderWizardSummary(label: summaryLabel ?? title, value: picked, isTTY: true, indent: summaryIndent))
+        print(renderWizardSummary(label: summaryLabel ?? title, value: picked, theme: theme, indent: summaryIndent))
       }
       return .selected(index)
     case .escape:
@@ -343,11 +341,12 @@ func promptEditableDefault(terminal: TerminalController, title: String, defaultV
     return .submitted(defaultValue)
   }
 
+  let theme = TUITheme(isTTY: true)
   var value = defaultValue
   var untouched = true
 
   func render() {
-    let line = renderWizardSummary(label: title, value: value, isTTY: true)
+    let line = renderWizardSummary(label: title, value: value, theme: theme)
     print("\r\u{001B}[2K\(line)", terminator: "")
     fflush(stdout)
   }
@@ -409,6 +408,7 @@ func promptYesNo(_ prompt: String, defaultYes: Bool) -> Bool {
 
 final class ElapsedTicker {
   private let fd: UnsafeMutablePointer<FILE>
+  private let theme: TUITheme
   private let prefix: String
   private let tickInterval: DispatchTimeInterval
   private let suffix: (@Sendable () -> String)?
@@ -424,16 +424,17 @@ final class ElapsedTicker {
     tickInterval: DispatchTimeInterval = .seconds(1),
     suffix: (@Sendable () -> String)? = nil
   ) {
+    let fd = toStderr ? stderr : stdout
+    self.fd = fd
+    self.theme = TUITheme(isTTY: TerminalController.isTTY(fileno(fd)))
     self.prefix = prefix
-    self.fd = toStderr ? stderr : stdout
     self.tickInterval = tickInterval
     self.suffix = suffix
   }
 
   func startIfTTY() {
     // Only render the live-updating line when attached to a terminal.
-    let isTTY = TerminalController.isTTY(fileno(fd))
-    guard isTTY else { return }
+    guard theme.isTTY else { return }
     start()
   }
 
@@ -465,8 +466,8 @@ final class ElapsedTicker {
   private func tick() {
     guard timer != nil, let startTime else { return }
     let elapsed = max(0, Int((DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000))
-    let timerText = TUITheme.title(format(elapsedSeconds: elapsed))
-    let base = "\(TUITheme.recordingDot(prefix)) \(timerText)"
+    let timerText = theme.title(format(elapsedSeconds: elapsed))
+    let base = "\(theme.recordingDot(prefix)) \(timerText)"
     let extra = suffix?()
     let columns = TerminalController.columns(fileno(fd))
     let s = fitTickerLine(base: base, suffix: extra, maxColumns: columns)

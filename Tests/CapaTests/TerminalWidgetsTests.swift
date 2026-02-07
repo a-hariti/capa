@@ -25,7 +25,8 @@ final class TerminalWidgetsTests: XCTestCase {
   }
 
   func testLoudnessMeterRenders() {
-    let s = LoudnessMeter.render(label: "MIC", db: -18, holdDB: -12, clipped: true, width: 8, style: .smooth)
+    let theme = TUITheme(isTTY: true)
+    let s = LoudnessMeter.render(label: "MIC", db: -18, holdDB: -12, clipped: true, width: 8, style: .smooth, theme: theme)
     XCTAssertTrue(s.contains("MIC"))
     XCTAssertTrue(s.contains("dB"))
     XCTAssertTrue(s.contains("!"))

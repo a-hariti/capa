@@ -66,6 +66,9 @@ struct Capa: AsyncParsableCommand {
   @Flag(name: [.short, .customLong("verbose")], help: "Show detailed capture settings/debug output")
   var verbose = false
 
+  private var theme = TUITheme(isTTY: false)
+  private var isTTYOut = false
+
   mutating func validate() throws {
     if let displaySelection {
       if case .index(let displayIndex) = displaySelection, displayIndex < 0 {
@@ -116,10 +119,9 @@ struct Capa: AsyncParsableCommand {
 
   mutating func run() async throws {
     let terminal = TerminalController()
-    let isTTYOut = TerminalController.isTTY(STDOUT_FILENO)
-    let banner = isTTYOut
-      ? "Capa \(TUITheme.label("(native macOS screen capture)"))"
-      : "Capa (native macOS screen capture)"
+    self.isTTYOut = TerminalController.isTTY(STDOUT_FILENO)
+    self.theme = TUITheme(isTTY: isTTYOut)
+    let banner = "Capa \(theme.label("(native macOS screen capture)"))"
     print(banner)
     print("")
 
@@ -368,14 +370,14 @@ struct Capa: AsyncParsableCommand {
 
     func rewind(to backIdx: Int) {
       if isDisplayCollapsed && (steps[backIdx] == .cursor || steps[backIdx] == .menuBar) {
-        clearLines(1, isTTY: isTTYOut)
-        _ = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: nil, menuBar: nil, isTTY: isTTYOut)
+        clearLines(1)
+        _ = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: nil, menuBar: nil)
         cursorSummaryVisible = false
         menuBarSummaryVisible = false
 
         if steps[backIdx] == .menuBar, let selectedCursorMode {
           let val = selectedCursorMode.enabled ? "Yes" : "No"
-          print(renderWizardSummary(label: "Cursor", value: val, isTTY: isTTYOut, indent: 2))
+          print(renderWizardSummary(label: "Cursor", value: val, theme: theme, indent: 2))
           cursorSummaryVisible = true
         }
 
@@ -384,9 +386,9 @@ struct Capa: AsyncParsableCommand {
         return
       }
 
-      clearLines(1, isTTY: isTTYOut)
+      clearLines(1)
       if steps[backIdx] == .projectName {
-        clearLines(2, isTTY: isTTYOut)
+        clearLines(2)
         displaySummaryVisible = false
         cursorSummaryVisible = false
         menuBarSummaryVisible = false
@@ -407,16 +409,16 @@ struct Capa: AsyncParsableCommand {
       let currentStep = steps[stepCursor]
 
       if (currentStep == .cursor || currentStep == .menuBar) && !displaySummaryVisible {
-        displaySummaryVisible = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: selectedCursorMode, menuBar: selectedMenuBarMode, isTTY: isTTYOut)
+        displaySummaryVisible = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: selectedCursorMode, menuBar: selectedMenuBarMode)
       }
 
       let isDisplayGroup = (currentStep == .display || currentStep == .cursor || currentStep == .menuBar)
       if !isDisplayCollapsed && !isDisplayGroup && displaySummaryVisible {
         if isTTYOut {
-          if menuBarSummaryVisible { clearLines(1, isTTY: isTTYOut) }
-          if cursorSummaryVisible { clearLines(1, isTTY: isTTYOut) }
-          clearLines(1, isTTY: isTTYOut)
-          _ = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: selectedCursorMode, menuBar: selectedMenuBarMode, isTTY: isTTYOut)
+          if menuBarSummaryVisible { clearLines(1) }
+          if cursorSummaryVisible { clearLines(1) }
+          clearLines(1)
+          _ = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: selectedCursorMode, menuBar: selectedMenuBarMode)
         }
         cursorSummaryVisible = false
         menuBarSummaryVisible = false
@@ -437,7 +439,7 @@ struct Capa: AsyncParsableCommand {
         if isSingleDisplay {
           selectedDisplayIndex = 0
           if !displaySummaryVisible {
-            displaySummaryVisible = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: selectedCursorMode, menuBar: selectedMenuBarMode, isTTY: isTTYOut)
+            displaySummaryVisible = printDisplaySummary(selectedDisplayIndex: selectedDisplayIndex, content: content, cursor: selectedCursorMode, menuBar: selectedMenuBarMode)
           }
           isDisplayCollapsed = false
           stepCursor += 1
@@ -755,28 +757,28 @@ struct Capa: AsyncParsableCommand {
     let codecName = (codec == .hevc) ? "H.265/HEVC" : "H.264"
     if verbose {
       print("")
-      print(sectionTitle("Settings:", isTTY: isTTYOut))
-      print(muted("  Capture: \(Int(geometry.sourceRect.width))x\(Int(geometry.sourceRect.height)) pt @ \(scaleStr)x => \(geometry.pixelWidth)x\(geometry.pixelHeight) px", isTTY: isTTYOut))
-      print(muted("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh", isTTY: isTTYOut))
+      print(sectionTitle("Settings:"))
+      print(muted("  Capture: \(Int(geometry.sourceRect.width))x\(Int(geometry.sourceRect.height)) pt @ \(scaleStr)x => \(geometry.pixelWidth)x\(geometry.pixelHeight) px"))
+      print(muted("  Video: \(codecName) \(geometry.pixelWidth)x\(geometry.pixelHeight) @ native refresh"))
       if cfrFPS == nil {
-        print(muted("  Screen timing: VFR", isTTY: isTTYOut))
+        print(muted("  Screen timing: VFR"))
       } else {
-        print(muted("  Screen timing: CFR \(cfrFPS ?? 60) fps", isTTY: isTTYOut))
+        print(muted("  Screen timing: CFR \(cfrFPS ?? 60) fps"))
       }
       if includeCamera {
-        print(muted("  Camera timing: native (no CFR)", isTTY: isTTYOut))
+        print(muted("  Camera timing: native (no CFR)"))
       }
       if includeMic, let audioDevice {
-        print(muted("  Microphone: \(audioDevice.localizedName)", isTTY: isTTYOut))
+        print(muted("  Microphone: \(audioDevice.localizedName)"))
       } else {
-        print(muted("  Microphone: none", isTTY: isTTYOut))
+        print(muted("  Microphone: none"))
       }
       if includeCamera, let cameraDevice {
-        print(muted("  Camera: \(cameraDevice.localizedName)", isTTY: isTTYOut))
+        print(muted("  Camera: \(cameraDevice.localizedName)"))
       } else {
-        print(muted("  Camera: none", isTTY: isTTYOut))
+        print(muted("  Camera: none"))
       }
-      print(muted("  System audio: \(audioRouting.includeSystemAudio ? "on" : "off")", isTTY: isTTYOut))
+      print(muted("  System audio: \(audioRouting.includeSystemAudio ? "on" : "off")"))
       print("")
     }
     let canReadKeys = TerminalController.isTTY(STDIN_FILENO)
@@ -905,7 +907,7 @@ struct Capa: AsyncParsableCommand {
         switch currentStep {
         case .ask:
           let hint = "(Better for video editors, might take a while)"
-          let promptTitle = "Post-process to constant fps? " + (isTTYOut ? TUITheme.label(hint) : hint)
+          let promptTitle = "Post-process to constant fps? " + theme.label(hint)
           let result = selectOptionWithBack(terminal: terminal, title: promptTitle, options: ["Yes", "No (keep VFR)"], defaultIndex: 0, allowBack: false, printSummary: false)
           switch result {
           case .selected(let idx):
@@ -926,7 +928,7 @@ struct Capa: AsyncParsableCommand {
             default: currentStep = .customFPS(dirty: false)
             }
           case .back:
-            if isTTYOut { clearLines(1, isTTY: isTTYOut) }
+            if isTTYOut { clearLines(1) }
             currentStep = .ask
           case .cancel: return
           }
@@ -938,30 +940,30 @@ struct Capa: AsyncParsableCommand {
             let trimmed = val.trimmingCharacters(in: .whitespaces)
             if let intVal = Int(trimmed) {
               if intVal <= 0 {
-                if dirty && isTTYOut { clearLines(2, isTTY: isTTYOut) }
-                else if isTTYOut { clearLines(1, isTTY: isTTYOut) }
+                if dirty && isTTYOut { clearLines(2) }
+                else if isTTYOut { clearLines(1) }
                 let msg = "Invalid input. Please enter a value greater than 0."
-                print(isTTYOut ? TUITheme.muted(msg) : msg)
+                print(theme.muted(msg))
                 currentStep = .customFPS(dirty: true)
               } else {
-                if dirty && isTTYOut { clearLines(2, isTTY: isTTYOut) }
+                if dirty && isTTYOut { clearLines(2) }
                 let clamped = min(240, intVal)
                 if clamped != intVal {
                   let msg = "Clamped to \(clamped) fps"
-                  print(isTTYOut ? TUITheme.muted(msg) : msg)
+                  print(theme.muted(msg))
                 }
                 finalCFRFPS = clamped
                 currentStep = .done
               }
             } else {
-              if dirty && isTTYOut { clearLines(2, isTTY: isTTYOut) }
-              else if isTTYOut { clearLines(1, isTTY: isTTYOut) }
+              if dirty && isTTYOut { clearLines(2) }
+              else if isTTYOut { clearLines(1) }
               let msg = "Invalid input. Please enter a whole number (24, 60 ...)"
-              print(isTTYOut ? TUITheme.muted(msg) : msg)
+              print(theme.muted(msg))
               currentStep = .customFPS(dirty: true)
             }
           case .cancel:
-            if dirty && isTTYOut { clearLines(2, isTTY: isTTYOut) }
+            if dirty && isTTYOut { clearLines(2) }
             currentStep = .selectFPS
           }
 
@@ -1027,11 +1029,11 @@ struct Capa: AsyncParsableCommand {
       print("")
     }
     if let cameraOutFile {
-      print(sectionTitle("Files:", isTTY: isTTYOut))
-      print("\(isTTYOut ? TUITheme.label("  Screen:") : "  Screen:") \(Utils.abbreviateHomePath(outFile.path))")
-      print("\(isTTYOut ? TUITheme.label("  Camera:") : "  Camera:") \(Utils.abbreviateHomePath(cameraOutFile.path))")
+      print(sectionTitle("Files:"))
+      print("\(theme.label("  Screen:")) \(Utils.abbreviateHomePath(outFile.path))")
+      print("\(theme.label("  Camera:")) \(Utils.abbreviateHomePath(cameraOutFile.path))")
     } else {
-      let savedLabel = isTTYOut ? TUITheme.label("Saved to:") : "Saved to:"
+      let savedLabel = theme.label("Saved to:")
       print("\(savedLabel) \(Utils.abbreviateHomePath(outFile.path))")
     }
 
@@ -1041,11 +1043,11 @@ struct Capa: AsyncParsableCommand {
       if screenHasMaster { parts.append("qaa=Master (mixed)") }
       if includeMic { parts.append("qac=Mic") }
       if audioRouting.includeSystemAudio { parts.append("qab=System") }
-      print(muted("  Audio tracks (language tags): " + parts.joined(separator: ", "), isTTY: isTTYOut))
+      print(muted("  Audio tracks (language tags): " + parts.joined(separator: ", ")))
     }
     if verbose, includeCamera, cameraOutFile != nil {
-      print(muted("  Video files: screen=\(outFile.lastPathComponent), camera=\(cameraOutFile!.lastPathComponent)", isTTY: isTTYOut))
-      print(muted("  Camera file audio: a0=Mic (if enabled), a1=Master (mixed, for alignment)", isTTY: isTTYOut))
+      print(muted("  Video files: screen=\(outFile.lastPathComponent), camera=\(cameraOutFile!.lastPathComponent)"))
+      print(muted("  Camera file audio: a0=Mic (if enabled), a1=Master (mixed, for alignment)"))
     }
     print("")
     let shouldOpen = !noOpenFlag
@@ -1070,18 +1072,18 @@ struct Capa: AsyncParsableCommand {
     }
   }
 
-  private func sectionTitle(_ s: String, isTTY: Bool) -> String { isTTY ? TUITheme.title(s) : s }
-  private func muted(_ s: String, isTTY: Bool) -> String { isTTY ? TUITheme.muted(s) : s }
-  private func optionText(_ s: String, isTTY: Bool) -> String { isTTY ? TUITheme.option(s) : s }
+  private func sectionTitle(_ s: String) -> String { theme.title(s) }
+  private func muted(_ s: String) -> String { theme.muted(s) }
+  private func optionText(_ s: String) -> String { theme.option(s) }
 
-  private func clearPreviousAnswerLine(isTTY: Bool) {
-    guard isTTY else { return }
+  private func clearPreviousAnswerLine() {
+    guard isTTYOut else { return }
     print("\u{001B}[1A\u{001B}[2K\r", terminator: "")
   }
 
-  private func clearLines(_ count: Int, isTTY: Bool) {
+  private func clearLines(_ count: Int) {
     guard count > 0 else { return }
-    for _ in 0..<count { clearPreviousAnswerLine(isTTY: isTTY) }
+    for _ in 0..<count { clearPreviousAnswerLine() }
   }
 
   private func displayConfigurationDescription(geometry: CaptureGeometry, cursor: OnOffMode?, menuBar: OnOffMode?) -> String {
@@ -1111,10 +1113,10 @@ struct Capa: AsyncParsableCommand {
     return captureGeometry(filter: f, fallbackLogicalSize: (Int(d.width), Int(d.height)))
   }
 
-  private func printDisplaySummary(selectedDisplayIndex: Int?, content: SCShareableContent, cursor: OnOffMode?, menuBar: OnOffMode?, isTTY: Bool) -> Bool {
+  private func printDisplaySummary(selectedDisplayIndex: Int?, content: SCShareableContent, cursor: OnOffMode?, menuBar: OnOffMode?) -> Bool {
     guard let geometry = selectedDisplayGeometry(selectedDisplayIndex: selectedDisplayIndex, content: content) else { return false }
     let desc = displayConfigurationDescription(geometry: geometry, cursor: cursor, menuBar: menuBar)
-    print(renderWizardSummary(label: "Display", value: desc, isTTY: isTTY))
+    print(renderWizardSummary(label: "Display", value: desc, theme: theme))
     return true
   }
 }

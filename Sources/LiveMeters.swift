@@ -63,12 +63,13 @@ final class LiveMeters: @unchecked Sendable {
     let sysClipped = now <= sys.clipUntil
     lock.unlock()
 
+    let theme = TUITheme(isTTY: TerminalController.isTTY(fileno(stderr)))
     var parts: [String] = []
     if includeMicrophone {
-      parts.append(LoudnessMeter.render(label: "MIC", db: micDB, holdDB: micHold, clipped: micClipped, width: 12, style: .smooth))
+      parts.append(LoudnessMeter.render(label: "MIC", db: micDB, holdDB: micHold, clipped: micClipped, width: 12, style: .smooth, theme: theme))
     }
     if includeSystemAudio {
-      parts.append(LoudnessMeter.render(label: "SYS", db: sysDB, holdDB: sysHold, clipped: sysClipped, width: 12, style: .smooth))
+      parts.append(LoudnessMeter.render(label: "SYS", db: sysDB, holdDB: sysHold, clipped: sysClipped, width: 12, style: .smooth, theme: theme))
     }
     return parts.joined(separator: "  ")
   }
