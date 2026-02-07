@@ -42,7 +42,9 @@ enum Ansi {
   }
 }
 
-enum TUITheme {
+struct TUITheme: Sendable, Codable {
+  let isTTY: Bool
+
   enum Color {
     static let title = 255
     static let label = 252
@@ -63,33 +65,41 @@ enum TUITheme {
     static let pickerHintSep = " • "
   }
 
-  static func title(_ s: String) -> String {
-    "\(Ansi.bold)\(Ansi.fg256(Color.title))\(s)\(Ansi.reset)"
+  init(isTTY: Bool) {
+    self.isTTY = isTTY
   }
 
-  static func primary(_ s: String) -> String {
-    "\(Ansi.fg256(Color.title))\(s)\(Ansi.reset)"
+  func title(_ s: String) -> String {
+    ansi(s, seq: "\(Ansi.bold)\(Ansi.fg256(Color.title))")
   }
 
-  static func label(_ s: String) -> String {
-    "\(Ansi.fg256(Color.label))\(s)\(Ansi.reset)"
+  func primary(_ s: String) -> String {
+    ansi(s, seq: Ansi.fg256(Color.title))
   }
 
-  static func option(_ s: String) -> String {
-    "\(Ansi.fg256(Color.option))\(s)\(Ansi.reset)"
+  func label(_ s: String) -> String {
+    ansi(s, seq: Ansi.fg256(Color.label))
   }
 
-  static func muted(_ s: String) -> String {
-    "\(Ansi.dim)\(Ansi.fg256(Color.muted))\(s)\(Ansi.reset)"
+  func option(_ s: String) -> String {
+    ansi(s, seq: Ansi.fg256(Color.option))
   }
 
-  static func accent(_ s: String, bold: Bool = false) -> String {
-    let b = bold ? Ansi.bold : ""
-    return "\(b)\(Ansi.fg256(Color.accent))\(s)\(Ansi.reset)"
+  func muted(_ s: String) -> String {
+    ansi(s, seq: "\(Ansi.dim)\(Ansi.fg256(Color.muted))")
   }
 
-  static func recordingDot(_ s: String) -> String {
-    "\(Ansi.bold)\(Ansi.fg256(Color.recordingDot))\(s)\(Ansi.reset)"
+  func accent(_ s: String, bold: Bool = false) -> String {
+    ansi(s, seq: (bold ? Ansi.bold : "") + Ansi.fg256(Color.accent))
+  }
+
+  func recordingDot(_ s: String) -> String {
+    ansi(s, seq: "\(Ansi.bold)\(Ansi.fg256(Color.recordingDot))")
+  }
+
+  /// Apply ANSI sequence if isTTY, otherwise return unstyled string.
+  private func ansi(_ s: String, seq: String) -> String {
+    isTTY ? "\(seq)\(s)\(Ansi.reset)" : s
   }
 }
 
@@ -129,6 +139,7 @@ struct Bar {
 
 final class ProgressBar: @unchecked Sendable {
   private let fd: UnsafeMutablePointer<FILE> = stderr
+  private let theme: TUITheme
   private let prefix: String
   private let total: Int64
   private let subtitle: String?
@@ -138,19 +149,20 @@ final class ProgressBar: @unchecked Sendable {
   private var subtitleRendered = false
 
   init(prefix: String, total: Int64, subtitle: String? = nil) {
+    self.theme = TUITheme(isTTY: TerminalController.isTTY(fileno(stderr)))
     self.prefix = prefix
     self.total = max(1, total)
     self.subtitle = Self.normalized(subtitle)
   }
 
   func startIfTTY() {
-    guard isatty(fileno(fd)) != 0 else { return }
+    guard theme.isTTY else { return }
     active = true
     write(Ansi.hideCursor)
     if let subtitle {
       // Reserve two lines under the bar so there's a blank separator line.
       write("\n\n")
-      write(TUITheme.label(subtitle))
+      write(theme.label(subtitle))
       write(Ansi.cursorUp(2) + Ansi.carriageReturn)
       subtitleRendered = true
     }
@@ -177,7 +189,7 @@ final class ProgressBar: @unchecked Sendable {
       trackBG: TUITheme.Color.track
     )
     let lead = prefix.isEmpty ? "" : "\(prefix) "
-    let s = "\(lead)\(bar)\(Ansi.reset) \(TUITheme.label("\(pct)%"))"
+    let s = "\(lead)\(bar)\(Ansi.reset) \(theme.label("\(pct)%"))"
 
     let visibleLen = Ansi.visibleWidth(s)
     let pad = max(0, lastVisibleLen - visibleLen)
@@ -194,14 +206,14 @@ final class ProgressBar: @unchecked Sendable {
       write(Ansi.cursorDown(2) + Ansi.carriageReturn)
       if let finalLine {
         write(Ansi.clearLine + Ansi.carriageReturn)
-        write(TUITheme.label(finalLine))
+        write(theme.label(finalLine))
       }
       write("\n")
       subtitleRendered = false
     } else {
       if let finalLine {
         write("\n")
-        write(TUITheme.label(finalLine))
+        write(theme.label(finalLine))
       }
       write("\n")
     }
@@ -240,7 +252,7 @@ struct LoudnessMeter {
     Ansi.fg256(colorCode(db: db))
   }
 
-  static func render(label: String, db: Float?, holdDB: Float? = nil, clipped: Bool = false, width: Int = 12, style: Bar.Style = .smooth) -> String {
+  static func render(label: String, db: Float?, holdDB: Float? = nil, clipped: Bool = false, width: Int = 12, style: Bar.Style = .smooth, theme: TUITheme) -> String {
     let reset = Ansi.reset
     guard let db else {
       let c = Ansi.fg256(TUITheme.Color.meterIdle)
@@ -257,7 +269,7 @@ struct LoudnessMeter {
       case .steps:
         bar = c + Bar.render(fraction: 0, width: width, style: .steps)
       }
-      return "\(TUITheme.label(label)) \(c)--dB \(bar)\(reset)"
+      return "\(theme.label(label)) \(c)--dB \(bar)\(reset)"
     }
 
     let c = color(db: db)
@@ -283,7 +295,7 @@ struct LoudnessMeter {
       bar = c + Bar.render(fraction: frac, width: width, style: .steps)
     }
 
-    return "\(TUITheme.label(label)) \(dbStr) \(bar)\(reset)"
+    return "\(theme.label(label)) \(dbStr) \(bar)\(reset)"
   }
 }
 
