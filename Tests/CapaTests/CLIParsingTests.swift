@@ -60,6 +60,14 @@ final class CLIParsingTests: XCTestCase {
     }
   }
 
+  func testDefaultFPSIsNil() throws {
+    let parsed = try Capa.parseAsRoot([])
+    guard let cmd = parsed as? Capa else {
+      return XCTFail("Failed to parse as Capa")
+    }
+    XCTAssertNil(cmd.fpsSelection, "Default fpsSelection should be nil (VFR)")
+  }
+
   func testUnknownArgumentThrows() {
     XCTAssertThrowsError(try Capa.parseAsRoot(["--nope"]))
   }

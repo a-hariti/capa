@@ -36,7 +36,7 @@ struct Capa: AsyncParsableCommand {
   @Option(name: .customLong("camera"), help: "Record camera by index (from --list-cameras) or AVCaptureDevice.uniqueID")
   var cameraSelection: CameraSelection?
 
-  @Option(name: .customLong("fps"), help: "Screen timing mode: integer CFR fps or 'vfr' (default: 60)")
+  @Option(name: .customLong("fps"), help: "Screen timing mode: integer CFR fps or 'vfr' (default: vfr, prompts if interactive)")
   var fpsSelection: FPSSelection?
 
   @Option(name: .customLong("codec"), help: "Video codec (h264|hevc)")
@@ -685,7 +685,8 @@ struct Capa: AsyncParsableCommand {
         cfrFPS = max(1, min(240, fps))
       }
     } else {
-      cfrFPS = 60
+      // Default to VFR (nil). In interactive mode, we will ask after recording.
+      cfrFPS = nil
     }
     let timecodeSync: TimecodeSyncContext? = includeCamera ? TimecodeSyncContext(fps: cfrFPS ?? 60) : nil
 
@@ -892,10 +893,42 @@ struct Capa: AsyncParsableCommand {
       }
     }
 
-    var didSkipCFR = false
-    if let cfrFPS {
+    var finalCFRFPS = cfrFPS
+    if finalCFRFPS == nil && !nonInteractive && fpsSelection == nil {
       print("")
-      print("Post-processing screen video to \(cfrFPS) fps...")
+      let promptTitle = "Post-process to constant fps? " + (isTTYOut ? TUITheme.label("(Better for video editors, might take a while)") : "(Better for video editors, might take a while)")
+      let result = selectOptionWithBack(
+        terminal: terminal,
+        title: promptTitle,
+        options: ["Yes", "No (keep VFR)"],
+        defaultIndex: 0,
+        allowBack: false,
+        printSummary: false
+      )
+      if case .selected(let idx) = result, idx == 0 {
+        let fpsResult = selectOptionWithBack(
+          terminal: terminal,
+          title: "Select Target FPS",
+          options: ["30 fps", "60 fps", "120 fps"],
+          defaultIndex: 1, // Default to 60
+          allowBack: false,
+          printSummary: false
+        )
+        if case .selected(let fpsIdx) = fpsResult {
+          switch fpsIdx {
+          case 0: finalCFRFPS = 30
+          case 1: finalCFRFPS = 60
+          case 2: finalCFRFPS = 120
+          default: finalCFRFPS = 60
+          }
+        }
+      }
+    }
+
+    var didSkipCFR = false
+    if let targetFPS = finalCFRFPS {
+      print("")
+      print("Post-processing screen video to \(targetFPS) fps...")
 
       let skipTranscode = SharedFlag(false)
       let transcodeFinished = SharedFlag(false)
@@ -912,7 +945,7 @@ struct Capa: AsyncParsableCommand {
         defer { transcodeFinished.set() }
         try await VideoCFR.rewriteInPlace(
           url: outFile,
-          fps: cfrFPS,
+          fps: targetFPS,
           shouldCancel: { skipTranscode.get() },
           cancelHint: "Escape to skip transcoding"
         )
